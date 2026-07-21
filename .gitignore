@@ -1,0 +1,7 @@
+node_modules/
+.env
+logs/
+*.log
+config.json
+session_*.jsonl
+.cache/
