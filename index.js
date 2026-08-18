@@ -232,10 +232,25 @@ wss.on('connection', (clientWs, request) => {
             if (aiMsg.setupComplete) {
                 console.log(`${GREEN}🟢 [GEMINI -> RELAY] setupComplete Received! Opening Gate.${RESET}`);
                 setupCompleteReceived = true;
+                let droppedAudioChunks = 0;
+                
                 while (messageQueue.length > 0) {
                     const msg = messageQueue.shift();
+                    
+                    const isAudioChunk = msg.clientMsg && msg.clientMsg.realtimeInput && 
+                                         (msg.clientMsg.realtimeInput.audio || msg.clientMsg.realtimeInput.mediaChunks);
+                    
+                    if (isAudioChunk) {
+                        droppedAudioChunks++;
+                        continue;
+                    }
+                    
                     console.log(`[Relay] Flushing buffered message (${msg.data.length} bytes)`);
                     geminiWs.send(msg.data, { binary: msg.isBinary });
+                }
+                
+                if (droppedAudioChunks > 0) {
+                    console.log(`🗑️ Dropped ${droppedAudioChunks} stale audio chunks from queue after reconnect`);
                 }
                 clientWs.send(messageStr);
                 return;
@@ -399,7 +414,7 @@ wss.on('connection', (clientWs, request) => {
         }
 
         if (geminiWs.readyState !== WebSocket.OPEN || !setupCompleteReceived) {
-            messageQueue.push({ data: messageStr, isBinary: !isJson });
+            messageQueue.push({ data: messageStr, isBinary: !isJson, clientMsg: clientMsg });
             return;
         }
 
