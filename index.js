@@ -64,6 +64,11 @@ This app never calls or texts anyone automatically — a human must physically c
 
 RULE 6 — NO GREETINGS, EVER
 Never introduce yourself, greet the user, or say things like "I am Tsehaye" or "How can I help you?" — not even at the very start of a new session. The user has already spoken their request by the time you receive it. Respond to that request directly, with zero preamble, every time.`;
+
+function buildSystemInstruction(contactNames) {
+    if (!contactNames || contactNames.length === 0) return MASTER_PROMPT;
+    return MASTER_PROMPT + "\n\nKNOWN CONTACTS: The user's phone contains these saved contacts: " + contactNames.join(", ") + ". When you hear a name and it's unclear or ambiguous, strongly prefer transcribing it as the closest matching name from this list rather than a different name you're not confident about. Still transcribe faithfully what you actually hear — only use this list to resolve genuine uncertainty, not to override a clear, confident hearing.";
+}
 // ═══════════════════════════════════════
 // SERVER SETUP
 // ═══════════════════════════════════════
@@ -116,6 +121,18 @@ wss.on('connection', (clientWs, request) => {
     clientWs._id = Math.random().toString(36).substr(2, 9);
     console.log(`[Handshake] New Client Connected. Assigned ID: ${clientWs._id}`);
 
+    let contactNames = [];
+    if (request.headers['x-tsehaye-contacts']) {
+        try {
+            const b64 = request.headers['x-tsehaye-contacts'];
+            const decoded = Buffer.from(b64, 'base64').toString('utf8');
+            contactNames = JSON.parse(decoded);
+            console.log(`📇 Loaded ${contactNames.length} contact names for grounding`);
+        } catch (e) {
+            console.error(`[Handshake] Failed to parse x-tsehaye-contacts header: ${e.message}`);
+        }
+    }
+
     const targetUrl = `${GEMINI_WS_URL}?key=${GEMINI_API_KEY}`;
     const geminiWs = new WebSocket(targetUrl);
 
@@ -136,7 +153,7 @@ wss.on('connection', (clientWs, request) => {
                     }
                 },
                 systemInstruction: {
-                    parts: [{ text: MASTER_PROMPT }]
+                    parts: [{ text: buildSystemInstruction(contactNames) }]
                 },
                 tools: [{
                     functionDeclarations: [
@@ -320,7 +337,7 @@ wss.on('connection', (clientWs, request) => {
                     model: "models/gemini-3.1-flash-live-preview",
                     generationConfig: { responseModalities: ["AUDIO"] },
                     realtimeInputConfig: { automaticActivityDetection: { disabled: true } },
-                    systemInstruction: { parts: [{ text: MASTER_PROMPT }] },
+                    systemInstruction: { parts: [{ text: buildSystemInstruction(contactNames) }] },
                     tools: [{
                         functionDeclarations: [
                             {
