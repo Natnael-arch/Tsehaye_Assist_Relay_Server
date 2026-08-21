@@ -277,11 +277,15 @@ wss.on('connection', (clientWs, request) => {
                 return;
             }
 
+            // Log transcription wherever Gemini puts it — top level or inside serverContent
+            const inputTx = aiMsg.inputTranscription
+                || aiMsg.serverContent?.inputTranscription;
+            if (inputTx?.text) {
+                console.log(`🎙️ [GEMINI HEARD]: "${inputTx.text}"`);
+            }
+
             if (aiMsg.serverContent) {
                 console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Prettified serverContent:\n${JSON.stringify(aiMsg.serverContent, null, 2)}${RESET}`);
-                if (aiMsg.serverContent.inputTranscription) {
-                    console.log(`🎙️ [GEMINI HEARD]: "${aiMsg.serverContent.inputTranscription.text}"`);
-                }
                 const parts = aiMsg.serverContent.modelTurn?.parts || [];
                 parts.forEach(async part => {
                     // Check for standard v1beta tool calls
