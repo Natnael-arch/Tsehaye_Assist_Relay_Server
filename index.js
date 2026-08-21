@@ -150,6 +150,7 @@ wss.on('connection', (clientWs, request) => {
                 generationConfig: {
                     responseModalities: ["AUDIO"]
                 },
+                inputAudioTranscription: {},
                 realtimeInputConfig: {
                     automaticActivityDetection: {
                         disabled: true
@@ -278,6 +279,9 @@ wss.on('connection', (clientWs, request) => {
 
             if (aiMsg.serverContent) {
                 console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Prettified serverContent:\n${JSON.stringify(aiMsg.serverContent, null, 2)}${RESET}`);
+                if (aiMsg.serverContent.inputTranscription) {
+                    console.log(`🎙️ [GEMINI HEARD]: "${aiMsg.serverContent.inputTranscription.text}"`);
+                }
                 const parts = aiMsg.serverContent.modelTurn?.parts || [];
                 parts.forEach(async part => {
                     // Check for standard v1beta tool calls
@@ -339,6 +343,7 @@ wss.on('connection', (clientWs, request) => {
                 setup: {
                     model: "models/gemini-3.1-flash-live-preview",
                     generationConfig: { responseModalities: ["AUDIO"] },
+                    inputAudioTranscription: {},
                     realtimeInputConfig: { automaticActivityDetection: { disabled: true } },
                     systemInstruction: { parts: [{ text: buildSystemInstruction(contactNames) }] },
                     tools: [{
