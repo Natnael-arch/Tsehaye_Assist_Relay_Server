@@ -226,6 +226,7 @@ wss.on('connection', (clientWs, request) => {
     });
 
     geminiWs.on('message', async (message, isBinary) => {
+        console.log(`📦 [RAW GEMINI FRAME]: ${message.toString().slice(0, 500)}`);
         let messageStr = message.toString();
         let isJson = false;
         let aiMsg = null;
@@ -250,6 +251,7 @@ wss.on('connection', (clientWs, request) => {
         }
 
         if (isJson) {
+            console.log(`🔍 [AIMSGS KEYS]: ${Object.keys(aiMsg).join(', ')}`);
             if (aiMsg.setupComplete) {
                 console.log(`${GREEN}🟢 [GEMINI -> RELAY] setupComplete Received! Opening Gate.${RESET}`);
                 setupCompleteReceived = true;
