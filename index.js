@@ -36,7 +36,15 @@ const GEMINI_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.gene
 const MASTER_PROMPT = `You are Tsehaye, a voice assistant for visually impaired users. Speak only Amharic. Follow these rules exactly.
 
 RULE 1 — SEARCHING FOR A CONTACT
-When the user asks to call or text someone, call search_contacts with BOTH the Amharic spelling and the English transliteration in one string, separated by a comma. Example: "አበበ, Abebe".
+When the user asks to call or text someone, call search_contacts immediately. Pass exactly what you heard the user say, then add your own phonetic transliteration of that same name into both scripts separated by a comma.
+
+Rules for what to pass:
+- If you heard a Latin name: pass "Latin, Amharic transliteration"
+  Example: heard "Nati" → pass "Nati, ናቲ"
+- If you heard an Amharic name: pass "Amharic, Latin transliteration"
+  Example: heard "አበበ" → pass "አበበ, Abebe"
+- Always transliterate what you actually heard — never substitute or guess a different name from memory or context.
+- If the user clarifies after disambiguation, apply the same rule to whatever they said in the clarification.
 
 RULE 2 — IF PERMISSION IS DENIED
 If any tool returns 'PERMISSION_DENIED', say exactly: "I need permission to do this. Please ask someone to help you enable this in settings."
@@ -163,13 +171,13 @@ wss.on('connection', (clientWs, request) => {
                     functionDeclarations: [
                         {
                             name: "search_contacts",
-                            description: "Call this function whenever the user asks to call someone. Provide both the Amharic exact spelling and its English/Latin transliteration (you can put both into the string).",
+                            description: "Call this function whenever the user asks to call or text someone. Pass exactly what you heard as a comma-separated pair of the name in both scripts — the original as heard plus your phonetic transliteration of it. Never substitute a name you know from context. Transliterate only what was actually spoken.",
                             parameters: {
                                 type: "OBJECT",
                                 properties: {
                                     name: {
                                         type: "STRING",
-                                        description: "The name of the person to call"
+                                        description: "The name exactly as heard followed by its phonetic transliteration in the other script, separated by a comma. Example: 'Nati, ናቲ' or 'አበበ, Abebe'. Never invent or substitute a different name."
                                     }
                                 },
                                 required: ["name"]
@@ -356,8 +364,8 @@ wss.on('connection', (clientWs, request) => {
                         functionDeclarations: [
                             {
                                 name: "search_contacts",
-                                description: "Call this function whenever the user asks to call someone. Provide both the Amharic exact spelling and its English/Latin transliteration separated by a comma.",
-                                parameters: { type: "OBJECT", properties: { name: { type: "STRING", description: "The name of the person to call" } }, required: ["name"] },
+                                description: "Call this function whenever the user asks to call or text someone. Pass exactly what you heard as a comma-separated pair of the name in both scripts — the original as heard plus your phonetic transliteration of it. Never substitute a name you know from context. Transliterate only what was actually spoken.",
+                                parameters: { type: "OBJECT", properties: { name: { type: "STRING", description: "The name exactly as heard followed by its phonetic transliteration in the other script, separated by a comma. Example: 'Nati, ናቲ' or 'አበበ, Abebe'. Never invent or substitute a different name." } }, required: ["name"] },
                                 response: { type: "OBJECT", properties: { result: { type: "STRING", description: "Status: FOUND, PENDING_CONFIRMATION, NOT_FOUND, AMBIGUITY, NO_NAME_PROVIDED" }, name: { type: "STRING", description: "The matched contact's display name" }, number: { type: "STRING", description: "The matched contact's phone number" }, query: { type: "STRING", description: "The search query used (only for NOT_FOUND)" } } }
                             },
                             {
