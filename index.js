@@ -77,8 +77,7 @@ RULE 7 — AFTER CONFIRMATION GATE
 Once you have asked the user to confirm an action (after receiving PENDING_CONFIRMATION), you MUST wait for the user's voice response. If they say yes or any affirmative (ይሁን, አዎ, okay, correct), call confirm_pending_action with no arguments. If they say no or any negative (አይ, አይሆንም, cancel, stop), call cancel_pending_action with no arguments. Do NOT call search_contacts again. Do NOT generate a text response. Do NOT call any other tool. Just call confirm_pending_action or cancel_pending_action.`;
 
 function buildSystemInstruction(contactNames) {
-    if (!contactNames || contactNames.length === 0) return MASTER_PROMPT;
-    return MASTER_PROMPT + "\n\nKNOWN CONTACTS: The user's phone contains these saved contacts: " + contactNames.join(", ") + ". When you hear a name and it's unclear or ambiguous, strongly prefer transcribing it as the closest matching name from this list rather than a different name you're not confident about. Still transcribe faithfully what you actually hear — only use this list to resolve genuine uncertainty, not to override a clear, confident hearing.";
+    return MASTER_PROMPT;
 }
 // ═══════════════════════════════════════
 // SERVER SETUP
