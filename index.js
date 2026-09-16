@@ -155,9 +155,9 @@ wss.on('connection', (clientWs, request) => {
             setup: {
                 model: "models/gemini-3.1-flash-live-preview",
                 generationConfig: {
-                    responseModalities: ["AUDIO"]
+                    responseModalities: ["AUDIO"],
+                    inputAudioTranscription: {}
                 },
-                inputAudioTranscription: {},
                 realtimeInputConfig: {
                     automaticActivityDetection: {
                         disabled: true
@@ -355,8 +355,7 @@ wss.on('connection', (clientWs, request) => {
             const setupMsg = {
                 setup: {
                     model: "models/gemini-3.1-flash-live-preview",
-                    generationConfig: { responseModalities: ["AUDIO"] },
-                    inputAudioTranscription: {},
+                    generationConfig: { responseModalities: ["AUDIO"], inputAudioTranscription: {} },
                     realtimeInputConfig: { automaticActivityDetection: { disabled: true } },
                     systemInstruction: { parts: [{ text: buildSystemInstruction(contactNames) }] },
                     tools: [{
