@@ -223,6 +223,24 @@ wss.on('connection', (clientWs, request) => {
                                     message_body: { type: "STRING", description: "The message body (only for PENDING_CONFIRMATION)" }
                                 }
                             }
+                        },
+                        {
+                            name: "confirm_pending_action",
+                            description: "Call this tool when the user verbally confirms a pending action by saying yes, okay, correct, ይሁን, አዎ, or any affirmative response.",
+                            parameters: {
+                                type: "OBJECT",
+                                properties: {},
+                                required: []
+                            }
+                        },
+                        {
+                            name: "cancel_pending_action",
+                            description: "Call this tool when the user verbally cancels a pending action by saying no, cancel, stop, አይ, አይሆንም, or any negative response.",
+                            parameters: {
+                                type: "OBJECT",
+                                properties: {},
+                                required: []
+                            }
                         }
                     ]
                 }]
@@ -377,6 +395,16 @@ wss.on('connection', (clientWs, request) => {
                                 description: "Sends an SMS text message to an existing contact.",
                                 parameters: { type: "OBJECT", properties: { recipient_name: { type: "STRING", description: "The name of the recipient" }, message_body: { type: "STRING", description: "The text content of the message" } }, required: ["recipient_name", "message_body"] },
                                 response: { type: "OBJECT", properties: { result: { type: "STRING", description: "Status: PENDING_CONFIRMATION, SENT, NOT_FOUND, AMBIGUITY, MISSING_ARGS, PERMISSION_DENIED, ERROR" }, name: { type: "STRING", description: "The matched contact's display name" }, number: { type: "STRING", description: "The matched contact's phone number" }, message_body: { type: "STRING", description: "The message body (only for PENDING_CONFIRMATION)" } } }
+                            },
+                            {
+                                name: "confirm_pending_action",
+                                description: "Call this tool when the user verbally confirms a pending action by saying yes, okay, correct, ይሁን, አዎ, or any affirmative response.",
+                                parameters: { type: "OBJECT", properties: {}, required: [] }
+                            },
+                            {
+                                name: "cancel_pending_action",
+                                description: "Call this tool when the user verbally cancels a pending action by saying no, cancel, stop, አይ, አይሆንም, or any negative response.",
+                                parameters: { type: "OBJECT", properties: {}, required: [] }
                             }
                         ]
                     }]
