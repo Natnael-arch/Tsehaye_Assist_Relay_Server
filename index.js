@@ -27,11 +27,6 @@ const RED = "\x1b[31m";
 const RESET = "\x1b[0m";
 
 const GEMINI_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
-// NEW VERSION — replace the existing `const MASTER_PROMPT = "...";` line entirely
-// with this. Using a template literal (backticks) instead of a quoted string
-// with \n escapes means real line breaks are just typed directly — this makes
-// the previous double-escaping bug (\\n instead of \n) structurally impossible
-// to reintroduce by accident.
 
 const MASTER_PROMPT = `You are Tsehaye, a voice assistant for visually impaired users. Speak only Amharic. Follow these rules exactly.
 
@@ -79,6 +74,7 @@ Once you have asked the user to confirm an action (after receiving PENDING_CONFI
 function buildSystemInstruction(contactNames) {
     return MASTER_PROMPT;
 }
+
 // ═══════════════════════════════════════
 // SERVER SETUP
 // ═══════════════════════════════════════
@@ -143,15 +139,17 @@ wss.on('connection', (clientWs, request) => {
         }
     }
 
+    const state = {
+        geminiWs: null,
+        setupCompleteReceived: false,
+        messageQueue: [],
+        reconnecting: false
+    };
+
     const targetUrl = `${GEMINI_WS_URL}?key=${GEMINI_API_KEY}`;
-    const geminiWs = new WebSocket(targetUrl);
 
-    const messageQueue = [];
-    let setupCompleteReceived = false;
-
-    geminiWs.on('open', () => {
-        // [PHASE 1] Official v1beta Setup
-        const setupMsg = {
+    function buildSetupMessage(contactNames) {
+        return {
             setup: {
                 model: "models/gemini-3.1-flash-live-preview",
                 generationConfig: {
@@ -246,19 +244,44 @@ wss.on('connection', (clientWs, request) => {
                 }]
             }
         };
-        console.log(`${BLUE}🔵 [RELAY -> GEMINI] Sending Setup Frame: ${setupMsg.setup.model}${RESET}`);
-        geminiWs.send(JSON.stringify(setupMsg));
-    });
+    }
 
-    geminiWs.on('message', async (message, isBinary) => {
-        console.log(`📦 [RAW GEMINI FRAME]: ${message.toString().slice(0, 500)}`);
-        let messageStr = message.toString();
-        let isJson = false;
-        let aiMsg = null;
+    function connectToGemini(isReconnect = false) {
+        if (state.geminiWs) {
+            // Fully tear down the old connection before replacing it
+            state.geminiWs.removeAllListeners();
+            if (state.geminiWs.readyState === WebSocket.OPEN ||
+                state.geminiWs.readyState === WebSocket.CONNECTING) {
+                state.geminiWs.close();
+            }
+        }
+        state.setupCompleteReceived = false;
+        const ws = new WebSocket(targetUrl);
+        state.geminiWs = ws;
 
-        // [CRITICAL FIX] Handle JSON-in-Binary handshake (Gemini v1beta behavior)
-        if (isBinary) {
-            if (messageStr.trim().startsWith('{')) {
+        ws.on('open', () => {
+            console.log(`${GREEN}🟢 [RELAY] Gemini ${isReconnect ? 'reconnected' : 'connected'}${RESET}`);
+            console.log(`${BLUE}🔵 [RELAY -> GEMINI] Sending Setup Frame: models/gemini-3.1-flash-live-preview${RESET}`);
+            ws.send(JSON.stringify(buildSetupMessage(contactNames)));
+        });
+
+        ws.on('message', async (message, isBinary) => {
+            console.log(`📦 [RAW GEMINI FRAME]: ${message.toString().slice(0, 500)}`);
+            let messageStr = message.toString();
+            let isJson = false;
+            let aiMsg = null;
+
+            // [CRITICAL FIX] Handle JSON-in-Binary handshake (Gemini v1beta behavior)
+            if (isBinary) {
+                if (messageStr.trim().startsWith('{')) {
+                    try {
+                        aiMsg = JSON.parse(messageStr);
+                        isJson = true;
+                    } catch (e) {
+                        isJson = false;
+                    }
+                }
+            } else {
                 try {
                     aiMsg = JSON.parse(messageStr);
                     isJson = true;
@@ -266,186 +289,112 @@ wss.on('connection', (clientWs, request) => {
                     isJson = false;
                 }
             }
-        } else {
-            try {
-                aiMsg = JSON.parse(messageStr);
-                isJson = true;
-            } catch (e) {
-                isJson = false;
-            }
-        }
 
-        if (isJson) {
-            console.log(`🔍 [AIMSGS KEYS]: ${Object.keys(aiMsg).join(', ')}`);
-            if (aiMsg.setupComplete) {
-                console.log(`${GREEN}🟢 [GEMINI -> RELAY] setupComplete Received! Opening Gate.${RESET}`);
-                setupCompleteReceived = true;
-                let droppedAudioChunks = 0;
-                
-                while (messageQueue.length > 0) {
-                    const msg = messageQueue.shift();
+            if (isJson) {
+                console.log(`🔍 [AIMSGS KEYS]: ${Object.keys(aiMsg).join(', ')}`);
+                if (aiMsg.setupComplete) {
+                    console.log(`${GREEN}🟢 [GEMINI -> RELAY] setupComplete Received! Opening Gate.${RESET}`);
+                    state.setupCompleteReceived = true;
+                    let droppedAudioChunks = 0;
                     
-                    const isAudioChunk = msg.clientMsg && msg.clientMsg.realtimeInput && 
-                                         (msg.clientMsg.realtimeInput.audio || msg.clientMsg.realtimeInput.mediaChunks);
-                    
-                    if (isAudioChunk) {
-                        droppedAudioChunks++;
-                        continue;
+                    while (state.messageQueue.length > 0) {
+                        const msg = state.messageQueue.shift();
+                        
+                        const isAudioChunk = msg.clientMsg && msg.clientMsg.realtimeInput && 
+                                             (msg.clientMsg.realtimeInput.audio || msg.clientMsg.realtimeInput.mediaChunks);
+                        
+                        if (isAudioChunk) {
+                            droppedAudioChunks++;
+                            continue;
+                        }
+                        
+                        console.log(`[Relay] Flushing buffered message (${msg.data.length} bytes)`);
+                        ws.send(msg.data, { binary: msg.isBinary });
                     }
                     
-                    console.log(`[Relay] Flushing buffered message (${msg.data.length} bytes)`);
-                    geminiWs.send(msg.data, { binary: msg.isBinary });
+                    if (droppedAudioChunks > 0) {
+                        console.log(`🗑️ Dropped ${droppedAudioChunks} stale audio chunks from queue after reconnect`);
+                    }
+                    clientWs.send(messageStr);
+                    return;
                 }
-                
-                if (droppedAudioChunks > 0) {
-                    console.log(`🗑️ Dropped ${droppedAudioChunks} stale audio chunks from queue after reconnect`);
+
+                // Log transcription wherever Gemini puts it — top level or inside serverContent
+                const inputTx = aiMsg.inputTranscription
+                    || aiMsg.serverContent?.inputTranscription;
+                if (inputTx?.text) {
+                    console.log(`🎙️ [GEMINI HEARD]: "${inputTx.text}"`);
                 }
-                clientWs.send(messageStr);
-                return;
-            }
 
-            // Log transcription wherever Gemini puts it — top level or inside serverContent
-            const inputTx = aiMsg.inputTranscription
-                || aiMsg.serverContent?.inputTranscription;
-            if (inputTx?.text) {
-                console.log(`🎙️ [GEMINI HEARD]: "${inputTx.text}"`);
-            }
+                if (aiMsg.serverContent) {
+                    console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Prettified serverContent:\n${JSON.stringify(aiMsg.serverContent, null, 2)}${RESET}`);
+                    const parts = aiMsg.serverContent.modelTurn?.parts || [];
+                    parts.forEach(async part => {
+                        // Check for standard v1beta tool calls
+                        if (part.executableCalls) {
+                            const call = part.executableCalls[0];
+                            if (call.name === "search_contacts") {
+                                const name = call.args?.name || "Unknown";
+                                console.log(`${BLUE}🔵 [SNIFFER] Detected tool_call 'search_contacts' for: ${name}${RESET}`);
+                            }
+                        }
 
-            if (aiMsg.serverContent) {
-                console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Prettified serverContent:\n${JSON.stringify(aiMsg.serverContent, null, 2)}${RESET}`);
-                const parts = aiMsg.serverContent.modelTurn?.parts || [];
-                parts.forEach(async part => {
-                    // Check for standard v1beta tool calls
-                    if (part.executableCalls) {
-                        const call = part.executableCalls[0];
+                        if (part.text) {
+                            console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Token: "${part.text}"${RESET}`);
+                        }
+                        if (part.inlineData) console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Inline Audio Chunks (${part.inlineData.data.length} bytes)${RESET}`);
+                        if (part.callCalls) console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Tool Requests: ${JSON.stringify(part.callCalls)}${RESET}`);
+                    });
+                }
+
+                // [TOP-LEVEL TOOL CALL] Gemini sends toolCall at root level
+                if (aiMsg.toolCall) {
+                    console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Prettified toolCall:\n${JSON.stringify(aiMsg.toolCall, null, 2)}${RESET}`);
+                    const calls = aiMsg.toolCall.functionCalls || [];
+                    for (const call of calls) {
                         if (call.name === "search_contacts") {
                             const name = call.args?.name || "Unknown";
-                            console.log(`${BLUE}🔵 [SNIFFER] Detected tool_call 'search_contacts' for: ${name}${RESET}`);
+                            console.log(`${BLUE}🔵 [SNIFFER] Detected toolCall 'search_contacts' for: ${name}${RESET}`);
                         }
                     }
+                }
 
-                    if (part.text) {
-                        console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Token: "${part.text}"${RESET}`);
-                    }
-                    if (part.inlineData) console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Inline Audio Chunks (${part.inlineData.data.length} bytes)${RESET}`);
-                    if (part.callCalls) console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Tool Requests: ${JSON.stringify(part.callCalls)}${RESET}`);
-                });
+                if (clientWs.readyState === WebSocket.OPEN) clientWs.send(messageStr);
+            } else {
+                // Raw Binary Audio
+                console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Binary Audio (${message.length} bytes)${RESET}`);
+                if (clientWs.readyState === WebSocket.OPEN) clientWs.send(message, { binary: true });
             }
-
-            // [TOP-LEVEL TOOL CALL] Gemini sends toolCall at root level
-            if (aiMsg.toolCall) {
-                console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Prettified toolCall:\n${JSON.stringify(aiMsg.toolCall, null, 2)}${RESET}`);
-                const calls = aiMsg.toolCall.functionCalls || [];
-                for (const call of calls) {
-                    if (call.name === "search_contacts") {
-                        const name = call.args?.name || "Unknown";
-                        console.log(`${BLUE}🔵 [SNIFFER] Detected toolCall 'search_contacts' for: ${name}${RESET}`);
-                    }
-                }
-            }
-
-            if (clientWs.readyState === WebSocket.OPEN) clientWs.send(messageStr);
-        } else {
-            // Raw Binary Audio
-            console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Binary Audio (${message.length} bytes)${RESET}`);
-            if (clientWs.readyState === WebSocket.OPEN) clientWs.send(message, { binary: true });
-        }
-    });
-
-    geminiWs.on('close', (code, reason) => {
-        console.log(`${RED}🔴 [GEMINI -> ERROR] Connection Closed (${code}): ${reason}${RESET}`);
-        
-        // Send error frame to Android client before attempting reconnect
-        if (clientWs.readyState === WebSocket.OPEN) {
-            clientWs.send(JSON.stringify({
-                type: "error",
-                error: { message: "AI service disconnected", code: "GEMINI_DISCONNECT" }
-            }));
-        }
-
-        // Attempt one reconnect to Gemini
-        console.log(`${YELLOW}🟡 [RELAY] Attempting one Gemini reconnect...${RESET}`);
-        const retryGemini = new WebSocket(targetUrl);
-        
-        retryGemini.on('open', () => {
-            console.log(`${GREEN}🟢 [RELAY] Gemini reconnect successful!${RESET}`);
-            // Re-send setup
-            const setupMsg = {
-                setup: {
-                    model: "models/gemini-3.1-flash-live-preview",
-                    generationConfig: { responseModalities: ["AUDIO"] },
-                    inputAudioTranscription: {},
-                    realtimeInputConfig: { automaticActivityDetection: { disabled: true } },
-                    systemInstruction: { parts: [{ text: buildSystemInstruction(contactNames) }] },
-                    tools: [{
-                        functionDeclarations: [
-                            {
-                                name: "search_contacts",
-                                description: "Call this function whenever the user asks to call or text someone. Pass exactly what you heard as a comma-separated pair of the name in both scripts — the original as heard plus your phonetic transliteration of it. Never substitute a name you know from context. Transliterate only what was actually spoken.",
-                                parameters: { type: "OBJECT", properties: { name: { type: "STRING", description: "The name exactly as heard followed by its phonetic transliteration in the other script, separated by a comma. Example: 'Nati, ናቲ' or 'አበበ, Abebe'. Never invent or substitute a different name." } }, required: ["name"] },
-                                response: { type: "OBJECT", properties: { result: { type: "STRING", description: "Status: FOUND, PENDING_CONFIRMATION, NOT_FOUND, AMBIGUITY, NO_NAME_PROVIDED" }, name: { type: "STRING", description: "The matched contact's display name" }, number: { type: "STRING", description: "The matched contact's phone number" }, query: { type: "STRING", description: "The search query used (only for NOT_FOUND)" } } }
-                            },
-                            {
-                                name: "add_new_contact",
-                                description: "Saves a new person to the user's phonebook.",
-                                parameters: { type: "OBJECT", properties: { name: { type: "STRING", description: "The name of the new contact" }, phone_number: { type: "STRING", description: "The phone number of the new contact" } }, required: ["name", "phone_number"] }
-                            },
-                            {
-                                name: "send_text_message",
-                                description: "Sends an SMS text message to an existing contact.",
-                                parameters: { type: "OBJECT", properties: { recipient_name: { type: "STRING", description: "The name of the recipient" }, message_body: { type: "STRING", description: "The text content of the message" } }, required: ["recipient_name", "message_body"] },
-                                response: { type: "OBJECT", properties: { result: { type: "STRING", description: "Status: PENDING_CONFIRMATION, SENT, NOT_FOUND, AMBIGUITY, MISSING_ARGS, PERMISSION_DENIED, ERROR" }, name: { type: "STRING", description: "The matched contact's display name" }, number: { type: "STRING", description: "The matched contact's phone number" }, message_body: { type: "STRING", description: "The message body (only for PENDING_CONFIRMATION)" } } }
-                            },
-                            {
-                                name: "confirm_pending_action",
-                                description: "Call this tool when the user verbally confirms a pending action by saying yes, okay, correct, ይሁን, አዎ, or any affirmative response.",
-                                parameters: { type: "OBJECT", properties: {}, required: [] }
-                            },
-                            {
-                                name: "cancel_pending_action",
-                                description: "Call this tool when the user verbally cancels a pending action by saying no, cancel, stop, አይ, አይሆንም, or any negative response.",
-                                parameters: { type: "OBJECT", properties: {}, required: [] }
-                            }
-                        ]
-                    }]
-                }
-            };
-            retryGemini.send(JSON.stringify(setupMsg));
-            
-            // Swap the reference — re-wire message handlers
-            retryGemini.on('message', (msg, isBin) => {
-                // Forward to client
-                if (clientWs.readyState === WebSocket.OPEN) {
-                    clientWs.send(msg.toString());
-                }
-            });
-            retryGemini.on('close', () => {
-                console.log(`${RED}🔴 [RELAY] Retry Gemini also closed. Giving up.${RESET}`);
-                clientWs.close();
-            });
-            retryGemini.on('error', (err) => {
-                console.error(`${RED}🔴 [RELAY] Retry Gemini error: ${err.message}${RESET}`);
-                clientWs.close();
-            });
         });
 
-        retryGemini.on('error', (err) => {
-            console.error(`${RED}🔴 [RELAY] Gemini reconnect failed: ${err.message}. Closing client.${RESET}`);
-            clientWs.close();
+        ws.on('close', (code, reason) => {
+            console.log(`${RED}🔴 [GEMINI -> ERROR] Connection Closed (${code}): ${reason}${RESET}`);
+            if (clientWs.readyState === WebSocket.OPEN) {
+                clientWs.send(JSON.stringify({
+                    type: "error",
+                    error: { message: "AI service disconnected", code: "GEMINI_DISCONNECT" }
+                }));
+            }
+            // Only reconnect if this closed connection is STILL the
+            // current active one — prevents a stale/already-replaced
+            // connection's close event from triggering a second,
+            // redundant reconnect
+            if (state.geminiWs === ws && !state.reconnecting) {
+                state.reconnecting = true;
+                console.log(`${YELLOW}🟡 [RELAY] Attempting Gemini reconnect...${RESET}`);
+                setTimeout(() => {
+                    state.reconnecting = false;
+                    connectToGemini(true);
+                }, 500);
+            }
         });
-    });
 
-    geminiWs.on('error', (err) => {
-        console.error(`${RED}🔴 [GEMINI -> ERROR] WebSocket Error: ${err.message}${RESET}`);
-        // Send error frame to client before closing
-        if (clientWs.readyState === WebSocket.OPEN) {
-            clientWs.send(JSON.stringify({
-                type: "error",
-                error: { message: `AI connection error: ${err.message}`, code: "GEMINI_ERROR" }
-            }));
-        }
-        clientWs.close();
-    });
+        ws.on('error', (err) => {
+            console.error(`${RED}🔴 [GEMINI -> ERROR] WebSocket Error: ${err.message}${RESET}`);
+        });
+    }
+
+    connectToGemini(false);
 
     clientWs.on('message', (message, isBinary) => {
         let messageStr = message.toString();
@@ -479,8 +428,8 @@ wss.on('connection', (clientWs, request) => {
             }
         }
 
-        if (geminiWs.readyState !== WebSocket.OPEN || !setupCompleteReceived) {
-            messageQueue.push({ data: messageStr, isBinary: !isJson, clientMsg: clientMsg });
+        if (!state.geminiWs || state.geminiWs.readyState !== WebSocket.OPEN || !state.setupCompleteReceived) {
+            state.messageQueue.push({ data: messageStr, isBinary: !isJson, clientMsg: clientMsg });
             return;
         }
 
@@ -490,7 +439,7 @@ wss.on('connection', (clientWs, request) => {
                 if (clientMsg.realtimeInput && (clientMsg.realtimeInput.activityStart || clientMsg.realtimeInput.activityEnd)) {
                     const signal = clientMsg.realtimeInput.activityStart ? 'activityStart' : 'activityEnd';
                     console.log(`🎤 [CLIENT -> RELAY] PTT Signal: ${signal}`);
-                    geminiWs.send(messageStr);
+                    state.geminiWs.send(messageStr);
                     return;
                 }
 
@@ -509,7 +458,7 @@ wss.on('connection', (clientWs, request) => {
                         const rms = Math.sqrt(sum / (buffer.length / 2));
                         console.log(`🎤 [CLIENT -> RELAY] RMS: ${rms.toFixed(2)} | B64: ${data.length} | Forwarding: realtimeInput.audio`);
                     }
-                    geminiWs.send(messageStr);
+                    state.geminiWs.send(messageStr);
                     return;
                 }
 
@@ -534,7 +483,7 @@ wss.on('connection', (clientWs, request) => {
                     const jsonOut = JSON.stringify(clientMsg);
                     console.log(`${BLUE}🔵 [RELAY -> GEMINI] Sending Tool Response at ${new Date().toISOString()}:${RESET}`);
                     console.log(`${BLUE}${jsonOut}${RESET}`);
-                    geminiWs.send(jsonOut);
+                    state.geminiWs.send(jsonOut);
                     return;
                 }
 
@@ -556,22 +505,25 @@ wss.on('connection', (clientWs, request) => {
                         }
                     };
                     console.log(`${BLUE}[ConflictHandler] Sending toolResponse for AMBIGUITY: ${matches}${RESET}`);
-                    geminiWs.send(JSON.stringify(toolResponse));
+                    state.geminiWs.send(JSON.stringify(toolResponse));
                     return;
                 }
 
-                geminiWs.send(messageStr);
+                state.geminiWs.send(messageStr);
             } catch (e) {
                 console.error(`[Relay] Error handling client JSON: ${e.message}`);
             }
         } else {
-            geminiWs.send(message, { binary: true });
+            state.geminiWs.send(message, { binary: true });
         }
     });
 
     clientWs.on('close', () => {
         console.log(`[Handshake] Client ${clientWs._id} Disconnected`);
-        geminiWs.close();
+        if (state.geminiWs) {
+            state.geminiWs.removeAllListeners();
+            state.geminiWs.close();
+        }
     });
 });
 
