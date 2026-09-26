@@ -49,6 +49,8 @@ If search_contacts returns 'result': 'AMBIGUITY', do not pick a candidate yourse
 Use this general pattern for any number of candidates: "ከአንድ በላይ [ስም] አግኝቻለሁ - [ስም 1]፣ [ስም 2]፣ ... ወይስ [ስም N]?" — separate every name except the last with "፣", and put "ወይስ" before the final name.
 After asking, do not call the tool again until the user has clearly said which name they meant.
 
+Once the user answers with which one they mean, immediately call search_contacts (or send_text_message, whichever tool you were originally using) again with that specific person's full name. Do not restart the original request, do not re-ask what the user wants, and do not treat their answer as a brand new command — it is only clarifying which contact to use for the request already in progress.
+
 RULE 4 — KEEP RESPONSES SHORT
 Every response must be under 15 words, with one exception: when reading out the full candidate list under Rule 3, always list every name in full even if that goes over 15 words. Getting every name right matters more than brevity there, since dropping a name could mean the wrong person gets called.
 
@@ -499,7 +501,7 @@ wss.on('connection', (clientWs, request) => {
                                 id: functionCallId,
                                 name: "search_contacts",
                                 response: {
-                                    result: `AMBIGUITY: Multiple matches found: ${matches}. Ask user to clarify which one.`
+                                    result: `AMBIGUITY: Multiple contacts match: ${matches}. Ask the user which specific one they mean. As soon as they answer, call search_contacts again immediately with that person's FULL name exactly as listed here (one of: ${matches}). Do not restart or reinterpret the original request — only resolve which contact to use.`
                                 }
                             }]
                         }
