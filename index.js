@@ -26,6 +26,10 @@ const YELLOW = "\x1b[33m";
 const RED = "\x1b[31m";
 const RESET = "\x1b[0m";
 
+const GEMINI_MODEL = process.env.GEMINI_LIVE_MODEL || "gemini-3.8-live";
+const GEMINI_MODEL_PATH = `models/${GEMINI_MODEL}`;
+const TOOL_BEHAVIOR = process.env.GEMINI_TOOL_BEHAVIOR || "BLOCKING";
+
 const GEMINI_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
 const MASTER_PROMPT = `You are Tsehaye, a voice assistant for visually impaired users. Speak only Amharic. Follow these rules exactly.
@@ -134,6 +138,7 @@ server.on('upgrade', (request, socket, head) => {
 wss.on('connection', (clientWs, request) => {
     clientWs._id = Math.random().toString(36).substr(2, 9);
     console.log(`[Handshake] New Client Connected. Assigned ID: ${clientWs._id}`);
+    console.log(`[RELAY] CLIENT CONNECT: id=${clientWs._id}`);
 
     let contactNames = [];
     if (request.headers['x-tsehaye-contacts']) {
@@ -159,7 +164,7 @@ wss.on('connection', (clientWs, request) => {
     function buildSetupMessage(contactNames) {
         return {
             setup: {
-                model: "models/gemini-3.1-flash-live-preview",
+                model: GEMINI_MODEL_PATH,
                 generationConfig: {
                     responseModalities: ["AUDIO"]
                 },
@@ -176,6 +181,7 @@ wss.on('connection', (clientWs, request) => {
                     functionDeclarations: [
                         {
                             name: "search_contacts",
+                            behavior: TOOL_BEHAVIOR,
                             description: "Call this function whenever the user asks to call or text someone. Pass exactly what you heard as a comma-separated pair of the name in both scripts — the original as heard plus your phonetic transliteration of it. Never substitute a name you know from context. Transliterate only what was actually spoken.",
                             parameters: {
                                 type: "OBJECT",
@@ -199,6 +205,7 @@ wss.on('connection', (clientWs, request) => {
                         },
                         {
                             name: "add_new_contact",
+                            behavior: TOOL_BEHAVIOR,
                             description: "Saves a new person to the user's phonebook.",
                             parameters: {
                                 type: "OBJECT",
@@ -211,6 +218,7 @@ wss.on('connection', (clientWs, request) => {
                         },
                         {
                             name: "send_text_message",
+                            behavior: TOOL_BEHAVIOR,
                             description: "Sends an SMS text message to an existing contact.",
                             parameters: {
                                 type: "OBJECT",
@@ -232,6 +240,7 @@ wss.on('connection', (clientWs, request) => {
                         },
                         {
                             name: "confirm_pending_action",
+                            behavior: TOOL_BEHAVIOR,
                             description: "Call this tool when the user verbally confirms a pending action by saying yes, okay, correct, ይሁን, አዎ, or any affirmative response.",
                             parameters: {
                                 type: "OBJECT",
@@ -241,6 +250,7 @@ wss.on('connection', (clientWs, request) => {
                         },
                         {
                             name: "cancel_pending_action",
+                            behavior: TOOL_BEHAVIOR,
                             description: "Call this tool when the user verbally cancels a pending action by saying no, cancel, stop, አይ, አይሆንም, or any negative response.",
                             parameters: {
                                 type: "OBJECT",
@@ -269,7 +279,7 @@ wss.on('connection', (clientWs, request) => {
 
         ws.on('open', () => {
             console.log(`${GREEN}🟢 [RELAY] Gemini ${isReconnect ? 'reconnected' : 'connected'}${RESET}`);
-            console.log(`${BLUE}🔵 [RELAY -> GEMINI] Sending Setup Frame: models/gemini-3.1-flash-live-preview${RESET}`);
+            console.log(`${BLUE}🔵 [RELAY -> GEMINI] Sending Setup Frame: ${GEMINI_MODEL_PATH}${RESET}`);
             ws.send(JSON.stringify(buildSetupMessage(contactNames)));
         });
 
@@ -336,6 +346,9 @@ wss.on('connection', (clientWs, request) => {
 
                 if (aiMsg.serverContent) {
                     console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Prettified serverContent:\n${JSON.stringify(aiMsg.serverContent, null, 2)}${RESET}`);
+                    if (aiMsg.serverContent.turnComplete === true) {
+                        console.log(`[RELAY] GEMINI TURN COMPLETE: clientId=${clientWs._id}`);
+                    }
                     const parts = aiMsg.serverContent.modelTurn?.parts || [];
                     parts.forEach(async part => {
                         // Check for standard v1beta tool calls
@@ -528,6 +541,7 @@ wss.on('connection', (clientWs, request) => {
 
     clientWs.on('close', () => {
         console.log(`[Handshake] Client ${clientWs._id} Disconnected`);
+        console.log(`[RELAY] CLIENT DISCONNECT: id=${clientWs._id}`);
         if (state.geminiWs) {
             state.geminiWs.removeAllListeners();
             state.geminiWs.close();
@@ -551,4 +565,5 @@ process.on('SIGTERM', () => {
 // ═══════════════════════════════════════
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`${GREEN}✅ Tsehaye Assist Relay Running on port ${PORT}${RESET}`);
+    console.log(`${GREEN}   Model: ${GEMINI_MODEL_PATH} | Tool behavior: ${TOOL_BEHAVIOR}${RESET}`);
 });

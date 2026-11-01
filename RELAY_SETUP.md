@@ -24,5 +24,14 @@ npm start
 - The server will start on `http://0.0.0.0:8080` (or `PORT` specified in environment).
 - The health check is available at `http://localhost:8080/health`.
 
-## 4. Why this matters
+## 4. Model & Tool Behavior Configuration
+
+Two environment variables control the Gemini Live connection:
+
+- `GEMINI_LIVE_MODEL` — model to use. Default: `gemini-3.8-live`. To roll back, set `export GEMINI_LIVE_MODEL=gemini-3.1-flash-live-preview`.
+- `GEMINI_TOOL_BEHAVIOR` — function-call behavior. Default: `BLOCKING`, so the model waits for each tool response (required for the call/text confirmation flow). Set to `NON_BLOCKING` only if you intentionally want async tool calls.
+
+The startup log prints the resolved model path and tool behavior so you can verify what the relay is using.
+
+## 5. Why this matters
 The Node.js relay ensures high-performance WebSocket proxying. By running this proxy, the server establishes the secure connection to Google's Gemini Live API, protecting the API key from exposure in the client application and handling authentication securely.
