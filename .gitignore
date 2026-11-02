@@ -2,6 +2,7 @@ node_modules/
 .env
 logs/
 *.log
+name-trace.log
 config.json
 session_*.jsonl
 .cache/

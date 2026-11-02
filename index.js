@@ -3,6 +3,7 @@
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
+const fs = require('fs');
 
 // ═══════════════════════════════════════
 // ENV VAR VALIDATION
@@ -29,6 +30,15 @@ const RESET = "\x1b[0m";
 const GEMINI_MODEL = process.env.GEMINI_LIVE_MODEL || "gemini-3.8-live";
 const GEMINI_MODEL_PATH = `models/${GEMINI_MODEL}`;
 const TOOL_BEHAVIOR = process.env.GEMINI_TOOL_BEHAVIOR || "BLOCKING";
+const GEMINI_DROP_CLIENT_TURNCOMPLETE = (process.env.GEMINI_DROP_CLIENT_TURNCOMPLETE || "0") === "1";
+const GEMINI_VOCAB_LIMIT = (() => {
+    const parsed = Number.parseInt(process.env.GEMINI_VOCAB_LIMIT || "0", 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+})();
+const GEMINI_LANG_HINTS = (process.env.GEMINI_LANG_HINTS || "")
+    .split(",")
+    .map((code) => code.trim())
+    .filter(Boolean);
 
 const GEMINI_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
@@ -85,6 +95,40 @@ Once you have asked the user to confirm an action (after receiving PENDING_CONFI
 
 function buildSystemInstruction(contactNames) {
     return MASTER_PROMPT;
+}
+
+function getContactDisplayName(entry) {
+    if (typeof entry === "string") {
+        return entry;
+    }
+    if (!entry || typeof entry !== "object") {
+        return "";
+    }
+    const name = entry.displayName ?? entry.display_name ?? entry["display-name"];
+    return typeof name === "string" ? name : "";
+}
+
+function buildBiasing(contactNames) {
+    const vocab = [];
+    if (GEMINI_VOCAB_LIMIT > 0 && Array.isArray(contactNames)) {
+        const seen = new Set();
+        for (const entry of contactNames) {
+            const name = getContactDisplayName(entry).trim();
+            if (!name) {
+                continue;
+            }
+            const key = name.toLowerCase();
+            if (seen.has(key)) {
+                continue;
+            }
+            seen.add(key);
+            vocab.push(name);
+            if (vocab.length >= GEMINI_VOCAB_LIMIT) {
+                break;
+            }
+        }
+    }
+    return { vocab, langHints: GEMINI_LANG_HINTS };
 }
 
 // ═══════════════════════════════════════
@@ -145,7 +189,8 @@ wss.on('connection', (clientWs, request) => {
         try {
             const b64 = request.headers['x-tsehaye-contacts'];
             const decoded = Buffer.from(b64, 'base64').toString('utf8');
-            contactNames = JSON.parse(decoded);
+            const parsed = JSON.parse(decoded);
+            contactNames = Array.isArray(parsed) ? parsed : [];
             console.log(`📇 Loaded ${contactNames.length} contact names for grounding`);
         } catch (e) {
             console.error(`[Handshake] Failed to parse x-tsehaye-contacts header: ${e.message}`);
@@ -156,19 +201,31 @@ wss.on('connection', (clientWs, request) => {
         geminiWs: null,
         setupCompleteReceived: false,
         messageQueue: [],
-        reconnecting: false
+        reconnecting: false,
+        lastHeard: "",
+        heardFresh: true,
+        lastPassed: null,
+        usageTotal: 0,
+        reconnectCount: 0
     };
 
     const targetUrl = `${GEMINI_WS_URL}?key=${GEMINI_API_KEY}`;
 
-    function buildSetupMessage(contactNames) {
+    function buildSetupMessage(contactNames, biasing = buildBiasing(contactNames)) {
+        const inputAudioTranscription = {};
+        if (GEMINI_VOCAB_LIMIT > 0) {
+            inputAudioTranscription.customVocabulary = biasing.vocab;
+        }
+        if (biasing.langHints.length > 0) {
+            inputAudioTranscription.languageCodes = biasing.langHints;
+        }
         return {
             setup: {
                 model: GEMINI_MODEL_PATH,
                 generationConfig: {
                     responseModalities: ["AUDIO"]
                 },
-                inputAudioTranscription: {},
+                inputAudioTranscription,
                 realtimeInputConfig: {
                     automaticActivityDetection: {
                         disabled: true
@@ -265,6 +322,9 @@ wss.on('connection', (clientWs, request) => {
     }
 
     function connectToGemini(isReconnect = false) {
+        if (isReconnect) {
+            state.reconnectCount++;
+        }
         if (state.geminiWs) {
             // Fully tear down the old connection before replacing it
             state.geminiWs.removeAllListeners();
@@ -280,7 +340,15 @@ wss.on('connection', (clientWs, request) => {
         ws.on('open', () => {
             console.log(`${GREEN}🟢 [RELAY] Gemini ${isReconnect ? 'reconnected' : 'connected'}${RESET}`);
             console.log(`${BLUE}🔵 [RELAY -> GEMINI] Sending Setup Frame: ${GEMINI_MODEL_PATH}${RESET}`);
-            ws.send(JSON.stringify(buildSetupMessage(contactNames)));
+            const biasing = buildBiasing(contactNames);
+            const setupFrame = JSON.stringify(buildSetupMessage(contactNames, biasing));
+            console.log(`[SETUP-SIZE] chars=${setupFrame.length}`);
+            console.log(`[BIASING] vocab=${biasing.vocab.length} langHints=${biasing.langHints.length ? biasing.langHints.join(",") : "none"} setupChars=${setupFrame.length}`);
+            if (GEMINI_VOCAB_LIMIT > 0) {
+                console.log(`[BIASING-LIST] ${JSON.stringify(biasing.vocab)}`);
+                console.log(`[BIASING-CUT] total=${contactNames.length} sent=${biasing.vocab.length}`);
+            }
+            ws.send(setupFrame);
         });
 
         ws.on('message', async (message, isBinary) => {
@@ -337,10 +405,24 @@ wss.on('connection', (clientWs, request) => {
                     return;
                 }
 
+                const usage = aiMsg.usageMetadata || aiMsg.serverContent?.usageMetadata;
+                if (usage) {
+                    const promptTokens = usage.promptTokenCount ?? 0;
+                    const responseTokens = usage.responseTokenCount ?? 0;
+                    const totalTokens = usage.totalTokenCount ?? (promptTokens + responseTokens);
+                    state.usageTotal += totalTokens;
+                    console.log(`[USAGE] clientId=${clientWs._id} prompt=${promptTokens} response=${responseTokens} total=${totalTokens} modalities=${summarizeUsageDetails(usage)}`);
+                }
+
                 // Log transcription wherever Gemini puts it — top level or inside serverContent
                 const inputTx = aiMsg.inputTranscription
                     || aiMsg.serverContent?.inputTranscription;
                 if (inputTx?.text) {
+                    if (state.heardFresh) {
+                        state.lastHeard = "";
+                        state.heardFresh = false;
+                    }
+                    state.lastHeard = appendHeard(state.lastHeard, inputTx.text);
                     console.log(`🎙️ [GEMINI HEARD]: "${inputTx.text}"`);
                 }
 
@@ -348,6 +430,7 @@ wss.on('connection', (clientWs, request) => {
                     console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Prettified serverContent:\n${JSON.stringify(aiMsg.serverContent, null, 2)}${RESET}`);
                     if (aiMsg.serverContent.turnComplete === true) {
                         console.log(`[RELAY] GEMINI TURN COMPLETE: clientId=${clientWs._id}`);
+                        state.heardFresh = true;
                     }
                     const parts = aiMsg.serverContent.modelTurn?.parts || [];
                     parts.forEach(async part => {
@@ -373,11 +456,19 @@ wss.on('connection', (clientWs, request) => {
                     console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Prettified toolCall:\n${JSON.stringify(aiMsg.toolCall, null, 2)}${RESET}`);
                     const calls = aiMsg.toolCall.functionCalls || [];
                     for (const call of calls) {
+                        if (call.name === "search_contacts" || call.name === "send_text_message") {
+                            const passed = (call.name === "search_contacts"
+                                ? call.args?.name
+                                : call.args?.recipient_name) || "";
+                            state.lastPassed = passed;
+                            traceToolCall(state.lastHeard || "", passed);
+                        }
                         if (call.name === "search_contacts") {
                             const name = call.args?.name || "Unknown";
                             console.log(`${BLUE}🔵 [SNIFFER] Detected toolCall 'search_contacts' for: ${name}${RESET}`);
                         }
                     }
+                    state.heardFresh = true;
                 }
 
                 if (clientWs.readyState === WebSocket.OPEN) clientWs.send(messageStr);
@@ -415,6 +506,56 @@ wss.on('connection', (clientWs, request) => {
         });
     }
 
+    const NAME_TRACE_LOG = './name-trace.log';
+
+    function appendHeard(prev, next) {
+        if (!prev) return next;
+        if (!next) return prev;
+        const needsSpace = !/\s$/.test(prev) && !/^\s/.test(next);
+        return prev + (needsSpace ? " " : "") + next;
+    }
+
+    function writeNameTrace(entry) {
+        try {
+            fs.appendFileSync(NAME_TRACE_LOG, JSON.stringify(entry) + "\n");
+        } catch (e) {
+            console.error(`[NAME-TRACE] write failed: ${e.message}`);
+        }
+    }
+
+    function traceToolCall(heard, passed) {
+        console.log(`[NAME-TRACE] heard="${heard}" | passed="${passed}"`);
+        writeNameTrace({
+            timestamp: new Date().toISOString(),
+            clientId: clientWs._id,
+            heard,
+            passed,
+            result: null,
+            matched: null
+        });
+    }
+
+    function summarizeUsageDetails(usage) {
+        const format = (details) => (details || [])
+            .map(d => `${d.modality || d.type || "UNKNOWN"}:${d.tokenCount ?? 0}`)
+            .join(",");
+        return `prompt[${format(usage.promptTokensDetails)}] response[${format(usage.responseTokensDetails)}]`;
+    }
+
+    function traceToolResponse(result, matched) {
+        const heard = state.lastHeard || "";
+        const passed = state.lastPassed || "";
+        console.log(`[NAME-TRACE] result=${result} matched="${matched}"`);
+        writeNameTrace({
+            timestamp: new Date().toISOString(),
+            clientId: clientWs._id,
+            heard,
+            passed,
+            result,
+            matched
+        });
+    }
+
     connectToGemini(false);
 
     clientWs.on('message', (message, isBinary) => {
@@ -445,6 +586,19 @@ wss.on('connection', (clientWs, request) => {
                 }
             } catch (e) {
                 console.error(`[Relay] Client JSON Parse Error: ${e.message}`);
+                return;
+            }
+        }
+
+        if (GEMINI_DROP_CLIENT_TURNCOMPLETE && isJson && clientMsg?.clientContent) {
+            const clientContent = clientMsg.clientContent;
+            const hasTurns = clientContent.turns && clientContent.turns.length;
+            const hasParts = clientContent.parts && clientContent.parts.length;
+            const isBareTurnComplete = clientContent.turnComplete === true
+                && !hasTurns
+                && !hasParts;
+            if (isBareTurnComplete) {
+                console.log(`[DROP] clientContent turnComplete dropped`);
                 return;
             }
         }
@@ -492,6 +646,10 @@ wss.on('connection', (clientWs, request) => {
                     console.log(`${BLUE}🔵 [CLIENT -> RELAY] toolResponse Received:\n${JSON.stringify(clientMsg.toolResponse, null, 2)}${RESET}`);
                     
                     const responseMap = clientMsg.toolResponse.functionResponses?.[0]?.response;
+                    traceToolResponse(
+                        responseMap?.result || "UNKNOWN",
+                        responseMap?.name || "-"
+                    );
                     if (responseMap?.result === "NOT_FOUND") {
                         console.log(`${YELLOW}[SEARCH] Searching phone for: ${responseMap.query || "unknown"} (0 results found)${RESET}`);
                         // Add suggestion so prompt instruction triggers
@@ -542,6 +700,7 @@ wss.on('connection', (clientWs, request) => {
     clientWs.on('close', () => {
         console.log(`[Handshake] Client ${clientWs._id} Disconnected`);
         console.log(`[RELAY] CLIENT DISCONNECT: id=${clientWs._id}`);
+        console.log(`[USAGE-SESSION] clientId=${clientWs._id} total=${state.usageTotal} reconnects=${state.reconnectCount}`);
         if (state.geminiWs) {
             state.geminiWs.removeAllListeners();
             state.geminiWs.close();
