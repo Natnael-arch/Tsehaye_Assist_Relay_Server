@@ -40,6 +40,8 @@ const GEMINI_LANG_HINTS = (process.env.GEMINI_LANG_HINTS || "")
     .map((code) => code.trim())
     .filter(Boolean);
 
+const VOCAB_ECHO_MIN_TERMS = 5;
+
 const GEMINI_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
 const MASTER_PROMPT = `You are Tsehaye, a voice assistant for visually impaired users. Speak only Amharic. Follow these rules exactly.
@@ -131,6 +133,28 @@ function buildBiasing(contactNames) {
     return { vocab, langHints: GEMINI_LANG_HINTS };
 }
 
+/**
+ * Counts how many distinct biasing-vocab terms appear in a transcription, which is how we
+ * detect the model "hearing" the contact list instead of the user. Whole-token only, so "Abe"
+ * inside "Abeba" does not count, and each term is keyed on its first long token so a pair
+ * like "Hana" / "Hana Gorebet" is one term, not two.
+ */
+function countVocabEcho(text, vocab) {
+    if (!text || !Array.isArray(vocab) || vocab.length === 0) {
+        return 0;
+    }
+    const split = (value) => value.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+    const heard = new Set(split(text));
+    const matched = new Set();
+    for (const entry of vocab) {
+        const key = split(getContactDisplayName(entry)).find((token) => token.length >= 3);
+        if (key && heard.has(key)) {
+            matched.add(key);
+        }
+    }
+    return matched.size;
+}
+
 // ═══════════════════════════════════════
 // SERVER SETUP
 // ═══════════════════════════════════════
@@ -206,7 +230,8 @@ wss.on('connection', (clientWs, request) => {
         heardFresh: true,
         lastPassed: null,
         usageTotal: 0,
-        reconnectCount: 0
+        reconnectCount: 0,
+        vocabTerms: []
     };
 
     const targetUrl = `${GEMINI_WS_URL}?key=${GEMINI_API_KEY}`;
@@ -341,6 +366,7 @@ wss.on('connection', (clientWs, request) => {
             console.log(`${GREEN}🟢 [RELAY] Gemini ${isReconnect ? 'reconnected' : 'connected'}${RESET}`);
             console.log(`${BLUE}🔵 [RELAY -> GEMINI] Sending Setup Frame: ${GEMINI_MODEL_PATH}${RESET}`);
             const biasing = buildBiasing(contactNames);
+            state.vocabTerms = biasing.vocab;
             const setupFrame = JSON.stringify(buildSetupMessage(contactNames, biasing));
             console.log(`[SETUP-SIZE] chars=${setupFrame.length}`);
             console.log(`[BIASING] vocab=${biasing.vocab.length} langHints=${biasing.langHints.length ? biasing.langHints.join(",") : "none"} setupChars=${setupFrame.length}`);
@@ -424,6 +450,10 @@ wss.on('connection', (clientWs, request) => {
                     }
                     state.lastHeard = appendHeard(state.lastHeard, inputTx.text);
                     console.log(`🎙️ [GEMINI HEARD]: "${inputTx.text}"`);
+                    const echoTerms = countVocabEcho(inputTx.text, state.vocabTerms);
+                    if (echoTerms >= VOCAB_ECHO_MIN_TERMS) {
+                        console.log(`[VOCAB-ECHO] heard="${inputTx.text.slice(0, 80)}" terms=${echoTerms}`);
+                    }
                 }
 
                 if (aiMsg.serverContent) {
@@ -542,17 +572,29 @@ wss.on('connection', (clientWs, request) => {
         return `prompt[${format(usage.promptTokensDetails)}] response[${format(usage.responseTokensDetails)}]`;
     }
 
-    function traceToolResponse(result, matched) {
-        const heard = state.lastHeard || "";
-        const passed = state.lastPassed || "";
-        console.log(`[NAME-TRACE] result=${result} matched="${matched}"`);
+    /**
+     * Records one answered tool call. Takes the whole response map so every result the app can
+     * emit lands in the trace with whatever identifies it: a matched name, ambiguity candidates,
+     * or the query that found nothing.
+     */
+    function traceToolResponse(responseMap) {
+        const map = typeof responseMap === "string" ? { result: responseMap } : (responseMap || {});
+        const result = map.result || "UNKNOWN";
+        const matched = map.name || "-";
+        const candidates = Array.isArray(map.matches) && map.matches.length ? map.matches : null;
+        const query = map.query || null;
+
+        console.log(`[NAME-TRACE] result=${result} matched="${matched}"` +
+            (candidates ? ` candidates=${JSON.stringify(candidates)}` : ""));
         writeNameTrace({
             timestamp: new Date().toISOString(),
             clientId: clientWs._id,
-            heard,
-            passed,
+            heard: state.lastHeard || "",
+            passed: state.lastPassed || "",
             result,
-            matched
+            matched,
+            ...(candidates ? { candidates } : {}),
+            ...(query ? { query } : {})
         });
     }
 
@@ -646,10 +688,7 @@ wss.on('connection', (clientWs, request) => {
                     console.log(`${BLUE}🔵 [CLIENT -> RELAY] toolResponse Received:\n${JSON.stringify(clientMsg.toolResponse, null, 2)}${RESET}`);
                     
                     const responseMap = clientMsg.toolResponse.functionResponses?.[0]?.response;
-                    traceToolResponse(
-                        responseMap?.result || "UNKNOWN",
-                        responseMap?.name || "-"
-                    );
+                    traceToolResponse(responseMap);
                     if (responseMap?.result === "NOT_FOUND") {
                         console.log(`${YELLOW}[SEARCH] Searching phone for: ${responseMap.query || "unknown"} (0 results found)${RESET}`);
                         // Add suggestion so prompt instruction triggers
@@ -670,6 +709,7 @@ wss.on('connection', (clientWs, request) => {
                 if (clientMsg.type === "AMBIGUITY") {
                     const matches = clientMsg.matches.join(", ");
                     const functionCallId = clientMsg.functionCallId;
+                    traceToolResponse({ result: "AMBIGUITY", matches: clientMsg.matches });
                     
                     // Send a proper toolResponse back to Gemini
                     const toolResponse = {
