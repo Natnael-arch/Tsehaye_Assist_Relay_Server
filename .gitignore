@@ -6,3 +6,10 @@ name-trace.log
 config.json
 session_*.jsonl
 .cache/
+
+# Local test artefacts
+probe_*.js
+voice_command.wav
+relay_*.log
+name-trace*.log
+phase*

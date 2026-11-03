@@ -31,8 +31,10 @@ const GEMINI_MODEL = process.env.GEMINI_LIVE_MODEL || "gemini-3.8-live";
 const GEMINI_MODEL_PATH = `models/${GEMINI_MODEL}`;
 const TOOL_BEHAVIOR = process.env.GEMINI_TOOL_BEHAVIOR || "BLOCKING";
 const GEMINI_DROP_CLIENT_TURNCOMPLETE = (process.env.GEMINI_DROP_CLIENT_TURNCOMPLETE || "0") === "1";
+// Contact-name biasing is on by default; an explicit GEMINI_VOCAB_LIMIT=0 turns it off.
 const GEMINI_VOCAB_LIMIT = (() => {
-    const parsed = Number.parseInt(process.env.GEMINI_VOCAB_LIMIT || "0", 10);
+    const raw = process.env.GEMINI_VOCAB_LIMIT;
+    const parsed = Number.parseInt(raw === undefined || raw === "" ? "20" : raw, 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 })();
 const GEMINI_LANG_HINTS = (process.env.GEMINI_LANG_HINTS || "")
@@ -491,7 +493,7 @@ wss.on('connection', (clientWs, request) => {
                                 ? call.args?.name
                                 : call.args?.recipient_name) || "";
                             state.lastPassed = passed;
-                            traceToolCall(state.lastHeard || "", passed);
+                            traceToolCall(state.lastHeard || "", passed, call.name);
                         }
                         if (call.name === "search_contacts") {
                             const name = call.args?.name || "Unknown";
@@ -553,11 +555,12 @@ wss.on('connection', (clientWs, request) => {
         }
     }
 
-    function traceToolCall(heard, passed) {
-        console.log(`[NAME-TRACE] heard="${heard}" | passed="${passed}"`);
+    function traceToolCall(heard, passed, fn) {
+        console.log(`[NAME-TRACE] fn=${fn} heard="${heard}" | passed="${passed}"`);
         writeNameTrace({
             timestamp: new Date().toISOString(),
             clientId: clientWs._id,
+            fn,
             heard,
             passed,
             result: null,
@@ -572,23 +575,41 @@ wss.on('connection', (clientWs, request) => {
         return `prompt[${format(usage.promptTokensDetails)}] response[${format(usage.responseTokensDetails)}]`;
     }
 
+    // These two never carry a contact or a fresh request: the app is echoing the outcome of an
+    // action that was already traced, so pairing them with lastHeard/lastPassed invents a
+    // request that belongs to an earlier turn.
+    const NON_CONVERSATIONAL_FNS = new Set(["confirm_pending_action", "cancel_pending_action"]);
+
     /**
      * Records one answered tool call. Takes the whole response map so every result the app can
      * emit lands in the trace with whatever identifies it: a matched name, ambiguity candidates,
      * or the query that found nothing.
      */
-    function traceToolResponse(responseMap) {
+    function traceToolResponse(responseMap, fn) {
         const map = typeof responseMap === "string" ? { result: responseMap } : (responseMap || {});
         const result = map.result || "UNKNOWN";
+
+        if (NON_CONVERSATIONAL_FNS.has(fn)) {
+            console.log(`[NAME-TRACE] fn=${fn} result=${result}`);
+            writeNameTrace({
+                timestamp: new Date().toISOString(),
+                clientId: clientWs._id,
+                fn,
+                result
+            });
+            return;
+        }
+
         const matched = map.name || "-";
         const candidates = Array.isArray(map.matches) && map.matches.length ? map.matches : null;
         const query = map.query || null;
 
-        console.log(`[NAME-TRACE] result=${result} matched="${matched}"` +
+        console.log(`[NAME-TRACE] fn=${fn || "unknown"} result=${result} matched="${matched}"` +
             (candidates ? ` candidates=${JSON.stringify(candidates)}` : ""));
         writeNameTrace({
             timestamp: new Date().toISOString(),
             clientId: clientWs._id,
+            fn: fn || null,
             heard: state.lastHeard || "",
             passed: state.lastPassed || "",
             result,
@@ -687,8 +708,9 @@ wss.on('connection', (clientWs, request) => {
                 if (clientMsg.toolResponse) {
                     console.log(`${BLUE}🔵 [CLIENT -> RELAY] toolResponse Received:\n${JSON.stringify(clientMsg.toolResponse, null, 2)}${RESET}`);
                     
-                    const responseMap = clientMsg.toolResponse.functionResponses?.[0]?.response;
-                    traceToolResponse(responseMap);
+                    const first = clientMsg.toolResponse.functionResponses?.[0];
+                    const responseMap = first?.response;
+                    traceToolResponse(responseMap, first?.name);
                     if (responseMap?.result === "NOT_FOUND") {
                         console.log(`${YELLOW}[SEARCH] Searching phone for: ${responseMap.query || "unknown"} (0 results found)${RESET}`);
                         // Add suggestion so prompt instruction triggers
@@ -709,7 +731,7 @@ wss.on('connection', (clientWs, request) => {
                 if (clientMsg.type === "AMBIGUITY") {
                     const matches = clientMsg.matches.join(", ");
                     const functionCallId = clientMsg.functionCallId;
-                    traceToolResponse({ result: "AMBIGUITY", matches: clientMsg.matches });
+                    traceToolResponse({ result: "AMBIGUITY", matches: clientMsg.matches }, "search_contacts");
                     
                     // Send a proper toolResponse back to Gemini
                     const toolResponse = {
