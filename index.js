@@ -4,6 +4,8 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const fs = require('fs');
+const crypto = require('crypto');
+const { createTenancy, CLOSE } = require('./tenancy');
 
 // ═══════════════════════════════════════
 // ENV VAR VALIDATION
@@ -45,6 +47,37 @@ const GEMINI_LANG_HINTS = (process.env.GEMINI_LANG_HINTS || "")
 const VOCAB_ECHO_MIN_TERMS = 5;
 
 const GEMINI_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
+
+// ═══════════════════════════════════════
+// TENANCY — who may hold a Gemini session, and on how many phones at once
+// ═══════════════════════════════════════
+// Disabled until the tester APK sends the device headers, so today's builds keep working.
+const PILOT_DATA_DIR = (() => {
+    const configured = process.env.PILOT_DATA_DIR;
+    if (configured) return configured;
+    return fs.existsSync('/data') ? '/data' : '.';
+})();
+const TENANCY_ENFORCED = (process.env.TENANCY_ENFORCED || "0") === "1";
+const ADMIN_PANEL_ENABLED = (process.env.ADMIN_PANEL_ENABLED || "0") === "1";
+const ADMIN_PATH = process.env.ADMIN_PATH || "/admin";
+const LEASE_TTL_MS = Number.parseInt(process.env.LEASE_TTL_MS || "75000", 10);
+
+const tenancy = createTenancy({
+    dataDir: PILOT_DATA_DIR,
+    enforced: TENANCY_ENFORCED,
+    leaseTtlMs: Number.isFinite(LEASE_TTL_MS) && LEASE_TTL_MS > 0 ? LEASE_TTL_MS : 75_000,
+    notify: (kind, message) => console.log(`${YELLOW}🔔 [ALERT ${kind}] ${message}${RESET}`),
+});
+
+function identityFrom(request) {
+    const h = request.headers || {};
+    return {
+        deviceId: String(h['x-tsehaye-device'] || ''),
+        token: String(h['x-tsehaye-token'] || ''),
+        signatureHash: String(h['x-tsehaye-signature'] || ''),
+        appVersion: String(h['x-tsehaye-app-version'] || ''),
+    };
+}
 
 const MASTER_PROMPT = `You are Tsehaye, a voice assistant for visually impaired users. Speak only Amharic. Follow these rules exactly.
 
@@ -189,6 +222,53 @@ app.get('/', (req, res) => {
 });
 
 // ═══════════════════════════════════════
+// ADMIN — approve, pause and revoke testers
+// ═══════════════════════════════════════
+const ADMIN_BASE = /^\/[A-Za-z0-9_-]{1,64}$/.test(process.env.ADMIN_PATH || '') ? process.env.ADMIN_PATH : '/admin';
+
+const adminHits = new Map();
+function adminRateLimited(ip) {
+    const at = Date.now();
+    const win = adminHits.get(ip) || { count: 0, resetAt: at + 60_000 };
+    if (at > win.resetAt) { win.count = 0; win.resetAt = at + 60_000; }
+    win.count += 1;
+    adminHits.set(ip, win);
+    return win.count > 30;
+}
+
+function keyMatches(given, expected) {
+    const a = Buffer.from(String(given));
+    const b = Buffer.from(String(expected));
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function requireAdmin(req, res, next) {
+    // Disabled by default: an admin surface is not shipped until it has been hardened.
+    if (!ADMIN_PANEL_ENABLED) return res.status(404).json({ error: 'not_found' });
+    if (adminRateLimited(req.ip || 'unknown')) return res.status(429).json({ error: 'rate_limited' });
+    const given = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    if (!ADMIN_KEY || !keyMatches(given, ADMIN_KEY)) return res.status(401).json({ error: 'unauthorized' });
+    next();
+}
+
+function adminAct(res, result) {
+    res.status(result && result.ok ? 200 : 400).json(result || { ok: false, error: 'failed' });
+}
+
+app.use(ADMIN_BASE, express.json({ limit: '4kb' }));
+
+app.get(`${ADMIN_BASE}/devices`, requireAdmin, (req, res) => {
+    res.json({ enforced: tenancy.enforced, lease_ttl_ms: LEASE_TTL_MS, connections: wss.clients.size, devices: tenancy.listDevices() });
+});
+
+app.post(`${ADMIN_BASE}/devices/:id/approve`, requireAdmin, (req, res) =>
+    adminAct(res, tenancy.approve(req.params.id, (req.body && req.body.testerName) || '')));
+app.post(`${ADMIN_BASE}/devices/:id/pause`, requireAdmin, (req, res) => adminAct(res, tenancy.pause(req.params.id)));
+app.post(`${ADMIN_BASE}/devices/:id/resume`, requireAdmin, (req, res) => adminAct(res, tenancy.resume(req.params.id)));
+app.post(`${ADMIN_BASE}/devices/:id/revoke`, requireAdmin, (req, res) => adminAct(res, tenancy.revoke(req.params.id)));
+app.post(`${ADMIN_BASE}/devices/:id/forget`, requireAdmin, (req, res) => adminAct(res, tenancy.forget(req.params.id)));
+
+// ═══════════════════════════════════════
 // WEBSOCKET UPGRADE HANDLER
 // ═══════════════════════════════════════
 server.on('upgrade', (request, socket, head) => {
@@ -196,20 +276,55 @@ server.on('upgrade', (request, socket, head) => {
     const url = request.url;
     if (url === '/relay' || url === '/') {
         wss.handleUpgrade(request, socket, head, (ws) => {
-            wss.emit('connection', ws, request);
+            // Decided after the socket exists: an approval or issued token has to be delivered
+            // on a live socket, or the phone can end up with a token it never received.
+            wss.emit('connection', ws, request, tenancy.decide(identityFrom(request)));
         });
     } else {
         socket.destroy();
     }
 });
 
+function closeForTenant(ws, decision) {
+    const reason = decision.reason || 'refused';
+    const status = decision.action === 'pending' ? 'pending' : 'refused';
+    try {
+        ws.send(JSON.stringify({ type: 'pairing', status, reason, tester: decision.testerName || '' }));
+    } catch (e) {
+        console.error(`[Tenancy] Could not send pairing frame: ${e.message}`);
+    }
+    setTimeout(() => {
+        try { ws.close(decision.closeCode || CLOSE.UNAVAILABLE, reason); } catch (e) { /* already gone */ }
+    }, 250);
+}
+
 // ═══════════════════════════════════════
 // WEBSOCKET CONNECTION HANDLER
 // ═══════════════════════════════════════
-wss.on('connection', (clientWs, request) => {
+wss.on('connection', (clientWs, request, decision) => {
     clientWs._id = Math.random().toString(36).substr(2, 9);
     console.log(`[Handshake] New Client Connected. Assigned ID: ${clientWs._id}`);
     console.log(`[RELAY] CLIENT CONNECT: id=${clientWs._id}`);
+
+    let tenant = null;
+    if (decision && decision.action !== 'serve') {
+        console.log(`${YELLOW}[Tenancy] ${decision.action}: ${decision.reason} (device=${decision.deviceId || 'unidentified'})${RESET}`);
+        closeForTenant(clientWs, decision);
+        return;
+    }
+    if (decision && decision.deviceId) {
+        tenant = decision;
+        clientWs._tenantId = tenant.deviceId;
+        clientWs._lastSeen = Date.now();
+        tenancy.acquireLease(tenant.deviceId, clientWs._id);
+        console.log(`${GREEN}[Tenancy] Serving "${tenant.testerName || 'unnamed'}" device=${tenant.deviceId} ${tenant.issueToken ? '(token issued)' : '(token ok)'}${RESET}`);
+        clientWs.send(JSON.stringify({
+            type: 'pairing',
+            status: 'approved',
+            tester: tenant.testerName || '',
+            token: tenant.issueToken || '',
+        }));
+    }
 
     let contactNames = [];
     if (request.headers['x-tsehaye-contacts']) {
@@ -622,7 +737,18 @@ wss.on('connection', (clientWs, request) => {
 
     connectToGemini(false);
 
+    clientWs.on('ping', () => {
+        clientWs._lastSeen = Date.now();
+        if (clientWs._tenantId) tenancy.renewLease(clientWs._tenantId);
+    });
+    clientWs.on('pong', () => {
+        clientWs._lastSeen = Date.now();
+        if (clientWs._tenantId) tenancy.renewLease(clientWs._tenantId);
+    });
+
     clientWs.on('message', (message, isBinary) => {
+        clientWs._lastSeen = Date.now();
+        if (clientWs._tenantId) tenancy.renewLease(clientWs._tenantId);
         let messageStr = message.toString();
         const isJson = messageStr.trim().startsWith('{');
         let clientMsg = null;
@@ -652,6 +778,14 @@ wss.on('connection', (clientWs, request) => {
                 console.error(`[Relay] Client JSON Parse Error: ${e.message}`);
                 return;
             }
+        }
+
+        if (isJson && clientMsg?.type === 'ANNOUNCEMENT_FAILED') {
+            const clip = String(clientMsg.clip || 'unknown').slice(0, 64);
+            const why = String(clientMsg.why || 'unknown').slice(0, 64);
+            console.error(`${RED}🔇 [SILENT FAILURE] device=${clientWs._tenantId || 'unpaired'} clip=${clip} why=${why}${RESET}`);
+            tenancy.alert('announcement_failed', `A phone could not speak to its user: clip=${clip} why=${why}`);
+            return;
         }
 
         if (GEMINI_DROP_CLIENT_TURNCOMPLETE && isJson && clientMsg?.clientContent) {
@@ -764,12 +898,37 @@ wss.on('connection', (clientWs, request) => {
         console.log(`[Handshake] Client ${clientWs._id} Disconnected`);
         console.log(`[RELAY] CLIENT DISCONNECT: id=${clientWs._id}`);
         console.log(`[USAGE-SESSION] clientId=${clientWs._id} total=${state.usageTotal} reconnects=${state.reconnectCount}`);
+        if (clientWs._tenantId) {
+            tenancy.releaseLease(clientWs._tenantId, clientWs._id);
+            console.log(`[Tenancy] Lease released for device=${clientWs._tenantId}`);
+        }
         if (state.geminiWs) {
             state.geminiWs.removeAllListeners();
             state.geminiWs.close();
         }
     });
 });
+
+// ═══════════════════════════════════════
+// TENANT HEARTBEAT
+// ═══════════════════════════════════════
+// A lease held by a phone that died silently would lock out the Tester's next device,
+// and the relay would never find out. Only sockets we accepted on tenancy are checked,
+// so legacy builds that never send the device headers are left alone.
+setInterval(() => {
+    const now = Date.now();
+    wss.clients.forEach((client) => {
+        if (!client._tenantId) return;
+        const lastSeen = client._lastSeen || 0;
+        if (now - lastSeen > LEASE_TTL_MS) {
+            console.log(`[Tenancy] Device=${client._tenantId} silent for ${Math.round((now - lastSeen) / 1000)}s — dropping`);
+            tenancy.releaseLease(client._tenantId, client._id);
+            client.terminate();
+            return;
+        }
+        client.ping();
+    });
+}, 30_000);
 
 // ═══════════════════════════════════════
 // GRACEFUL SHUTDOWN
@@ -788,4 +947,6 @@ process.on('SIGTERM', () => {
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`${GREEN}✅ Tsehaye Assist Relay Running on port ${PORT}${RESET}`);
     console.log(`${GREEN}   Model: ${GEMINI_MODEL_PATH} | Tool behavior: ${TOOL_BEHAVIOR}${RESET}`);
+    console.log(`   Tenancy: ${TENANCY_ENFORCED ? "ENFORCED" : "disabled (all clients served)"} | data dir: ${PILOT_DATA_DIR} | lease ttl: ${LEASE_TTL_MS}ms`);
+    console.log(`   Admin panel: ${ADMIN_PANEL_ENABLED ? `on ${ADMIN_BASE}` : "disabled"}`);
 });
