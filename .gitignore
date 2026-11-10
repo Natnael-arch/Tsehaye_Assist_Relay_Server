@@ -11,6 +11,10 @@ session_*.jsonl
 pilot-pairing.json
 pilot-pairing.json.*.tmp
 
+# Per-Tester usage counters. Same volume, same atomic-write pattern.
+pilot-usage.json
+pilot-usage.json.*.tmp
+
 # Local test artefacts
 probe_*.js
 voice_command.wav

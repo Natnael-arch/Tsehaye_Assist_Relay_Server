@@ -6,6 +6,7 @@ const WebSocket = require('ws');
 const fs = require('fs');
 const crypto = require('crypto');
 const { createTenancy, CLOSE } = require('./tenancy');
+const { createLimits, REASON, pcmDurationMs } = require('./limits');
 
 // ═══════════════════════════════════════
 // ENV VAR VALIDATION
@@ -77,6 +78,61 @@ function identityFrom(request) {
         signatureHash: String(h['x-tsehaye-signature'] || ''),
         appVersion: String(h['x-tsehaye-app-version'] || ''),
     };
+}
+
+// ═══════════════════════════════════════
+// LIMITS — how much of the shared Gemini quota one Tester may spend
+// ═══════════════════════════════════════
+function envInt(name, fallback) {
+    const parsed = Number.parseInt(process.env[name] ?? '', 10);
+    return Number.isFinite(parsed) ? parsed : fallback;
+}
+function positiveInt(name, fallback) {
+    const value = envInt(name, fallback);
+    return value > 0 ? value : fallback;
+}
+
+const limits = createLimits({
+    dataDir: PILOT_DATA_DIR,
+    notify: (kind, message) => console.log(`${YELLOW}🔔 [ALERT ${kind}] ${message}${RESET}`),
+    maxLiveSessions: positiveInt('MAX_LIVE_SESSIONS', 3),
+    globalDailyOpenLimit: positiveInt('GLOBAL_DAILY_OPENS', 100),
+    dailyOpenLimit: positiveInt('DAILY_OPENS_PER_TESTER', 40),
+    dailyAudioMinutes: positiveInt('DAILY_AUDIO_MINUTES_PER_TESTER', 20),
+    // Ethiopia is UTC+3, so the allowance resets at the Tester's midnight, not at 03:00 local.
+    dayOffsetMinutes: envInt('PILOT_DAY_OFFSET_MINUTES', 180),
+    maxConsecutiveFailures: positiveInt('GEMINI_MAX_OPEN_FAILURES', 3),
+    idleTeardownMs: positiveInt('GEMINI_IDLE_TEARDOWN_MS', 30_000),
+    maxSessionMs: positiveInt('GEMINI_MAX_SESSION_MS', 15 * 60_000),
+});
+
+// Privacy masking & anonymous metric helpers
+function maskText(str) {
+    if (!str || typeof str !== 'string') return '';
+    if (str.length <= 2) return '*'.repeat(str.length);
+    return str[0] + '*'.repeat(Math.min(str.length - 2, 8)) + str[str.length - 1];
+}
+
+function maskId(id) {
+    if (!id || typeof id !== 'string') return 'unidentified';
+    return crypto.createHash('sha256').update(id).digest('hex').slice(0, 8);
+}
+
+function contactBucket(count) {
+    if (count <= 0) return '0';
+    if (count <= 20) return '1-20';
+    if (count <= 50) return '21-50';
+    if (count <= 100) return '51-100';
+    return '100+';
+}
+
+function maskArgs(args) {
+    if (!args || typeof args !== 'object') return args;
+    const masked = {};
+    for (const [k, v] of Object.entries(args)) {
+        masked[k] = typeof v === 'string' ? maskText(v) : v;
+    }
+    return masked;
 }
 
 const MASTER_PROMPT = `You are Tsehaye, a voice assistant for visually impaired users. Speak only Amharic. Follow these rules exactly.
@@ -258,8 +314,14 @@ function adminAct(res, result) {
 app.use(ADMIN_BASE, express.json({ limit: '4kb' }));
 
 app.get(`${ADMIN_BASE}/devices`, requireAdmin, (req, res) => {
-    res.json({ enforced: tenancy.enforced, lease_ttl_ms: LEASE_TTL_MS, connections: wss.clients.size, devices: tenancy.listDevices() });
+    const devices = tenancy.listDevices().map((d) => ({ ...d, usage: limits.usageFor(d.deviceId) }));
+    res.json({ enforced: tenancy.enforced, lease_ttl_ms: LEASE_TTL_MS, connections: wss.clients.size, devices });
 });
+
+app.get(`${ADMIN_BASE}/usage`, requireAdmin, (req, res) => res.json(limits.snapshot()));
+
+app.post(`${ADMIN_BASE}/devices/:id/clear-hard-stop`, requireAdmin, (req, res) =>
+    adminAct(res, limits.clearHardStop(req.params.id)));
 
 app.post(`${ADMIN_BASE}/devices/:id/approve`, requireAdmin, (req, res) =>
     adminAct(res, tenancy.approve(req.params.id, (req.body && req.body.testerName) || '')));
@@ -317,7 +379,7 @@ wss.on('connection', (clientWs, request, decision) => {
         clientWs._tenantId = tenant.deviceId;
         clientWs._lastSeen = Date.now();
         tenancy.acquireLease(tenant.deviceId, clientWs._id);
-        console.log(`${GREEN}[Tenancy] Serving "${tenant.testerName || 'unnamed'}" device=${tenant.deviceId} ${tenant.issueToken ? '(token issued)' : '(token ok)'}${RESET}`);
+        console.log(`${GREEN}[Tenancy] Serving "${tenant.testerName || 'unnamed'}" device=${tenant.deviceId} version=${tenant.appVersion || 'unknown'} ${tenant.issueToken ? '(token issued)' : '(token ok)'}${RESET}`);
         clientWs.send(JSON.stringify({
             type: 'pairing',
             status: 'approved',
@@ -338,18 +400,19 @@ wss.on('connection', (clientWs, request, decision) => {
             console.error(`[Handshake] Failed to parse x-tsehaye-contacts header: ${e.message}`);
         }
     }
+    console.log(`[METRIC] event=session_start device=${maskId(clientWs._tenantId)} version=${tenant?.appVersion || 'unknown'} contactsBucket=${contactBucket(contactNames.length)}`);
 
     const state = {
         geminiWs: null,
         setupCompleteReceived: false,
         messageQueue: [],
-        reconnecting: false,
         lastHeard: "",
         heardFresh: true,
         lastPassed: null,
         usageTotal: 0,
-        reconnectCount: 0,
-        vocabTerms: []
+        sessionOpens: 0,
+        vocabTerms: [],
+        liveSessionOpen: false
     };
 
     const targetUrl = `${GEMINI_WS_URL}?key=${GEMINI_API_KEY}`;
@@ -464,10 +527,83 @@ wss.on('connection', (clientWs, request, decision) => {
         };
     }
 
-    function connectToGemini(isReconnect = false) {
-        if (isReconnect) {
-            state.reconnectCount++;
+    // ── Session lifecycle: push-to-talk drives Gemini, not the phone's socket ──
+    let idleTimer = null;
+    let maxSessionTimer = null;
+
+    function endLiveSession() {
+        if (!state.liveSessionOpen) return;
+        state.liveSessionOpen = false;
+        limits.noteClose(clientWs._tenantId || '');
+    }
+
+    function cancelIdleTeardown() {
+        if (idleTimer) {
+            clearTimeout(idleTimer);
+            idleTimer = null;
         }
+    }
+
+    function cancelMaxSessionTimer() {
+        if (maxSessionTimer) {
+            clearTimeout(maxSessionTimer);
+            maxSessionTimer = null;
+        }
+    }
+
+    function teardownGemini(reason) {
+        cancelIdleTeardown();
+        cancelMaxSessionTimer();
+        const ws = state.geminiWs;
+        state.geminiWs = null;
+        state.setupCompleteReceived = false;
+        state.messageQueue.length = 0;
+        endLiveSession();
+        if (ws) {
+            ws.removeAllListeners();
+            try { ws.close(); } catch (e) { /* already gone */ }
+        }
+        console.log(`[SESSION] Gemini torn down reason=${reason} device=${clientWs._tenantId || 'unpaired'} live=${limits.liveCount()}`);
+    }
+
+    function scheduleIdleTeardown() {
+        cancelIdleTeardown();
+        idleTimer = setTimeout(() => {
+            idleTimer = null;
+            teardownGemini('idle');
+        }, limits.idleTeardownMs);
+    }
+
+    // A guardrail that only logs is a silent failure: the app speaks UNAVAILABLE on an error frame.
+    function speakLimit(reason, retryAfterMs) {
+        console.log(`${YELLOW}[LIMIT] Refusing Gemini open device=${clientWs._tenantId || 'unpaired'} reason=${reason} retryAfterMs=${retryAfterMs || 0}${RESET}`);
+        if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(JSON.stringify({
+                type: 'error',
+                error: { message: `Service limit: ${reason}`, code: `LIMIT_${String(reason).toUpperCase()}` }
+            }));
+        }
+    }
+
+    function ensureGemini() {
+        const ws = state.geminiWs;
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return true;
+        const deviceId = clientWs._tenantId || '';
+        const verdict = limits.canOpen(deviceId);
+        if (!verdict.ok) {
+            state.messageQueue.length = 0;
+            speakLimit(verdict.reason, verdict.retryAfterMs);
+            return false;
+        }
+        limits.noteOpen(deviceId);
+        state.liveSessionOpen = true;
+        console.log(`[SESSION] Opening Gemini on push-to-talk device=${deviceId || 'unpaired'} live=${limits.liveCount()}`);
+        connectToGemini();
+        return true;
+    }
+
+    function connectToGemini() {
+        state.sessionOpens++;
         if (state.geminiWs) {
             // Fully tear down the old connection before replacing it
             state.geminiWs.removeAllListeners();
@@ -481,7 +617,12 @@ wss.on('connection', (clientWs, request, decision) => {
         state.geminiWs = ws;
 
         ws.on('open', () => {
-            console.log(`${GREEN}🟢 [RELAY] Gemini ${isReconnect ? 'reconnected' : 'connected'}${RESET}`);
+            console.log(`${GREEN}🟢 [RELAY] Gemini connected (open #${state.sessionOpens})${RESET}`);
+            cancelMaxSessionTimer();
+            maxSessionTimer = setTimeout(() => {
+                teardownGemini('max_session_length');
+                speakLimit('max_session_length');
+            }, limits.maxSessionMs);
             console.log(`${BLUE}🔵 [RELAY -> GEMINI] Sending Setup Frame: ${GEMINI_MODEL_PATH}${RESET}`);
             const biasing = buildBiasing(contactNames);
             state.vocabTerms = biasing.vocab;
@@ -489,7 +630,7 @@ wss.on('connection', (clientWs, request, decision) => {
             console.log(`[SETUP-SIZE] chars=${setupFrame.length}`);
             console.log(`[BIASING] vocab=${biasing.vocab.length} langHints=${biasing.langHints.length ? biasing.langHints.join(",") : "none"} setupChars=${setupFrame.length}`);
             if (GEMINI_VOCAB_LIMIT > 0) {
-                console.log(`[BIASING-LIST] ${JSON.stringify(biasing.vocab)}`);
+                console.log(`[BIASING-LIST] count=${biasing.vocab.length} (contacts masked)`);
                 console.log(`[BIASING-CUT] total=${contactNames.length} sent=${biasing.vocab.length}`);
             }
             ws.send(setupFrame);
@@ -525,26 +666,16 @@ wss.on('connection', (clientWs, request, decision) => {
                 if (aiMsg.setupComplete) {
                     console.log(`${GREEN}🟢 [GEMINI -> RELAY] setupComplete Received! Opening Gate.${RESET}`);
                     state.setupCompleteReceived = true;
-                    let droppedAudioChunks = 0;
-                    
+                    limits.noteSuccess(clientWs._tenantId || '');
+                    // This session was opened by the press that queued these frames, so the audio
+                    // is the command itself. Dropping it would leave the Tester speaking into a void.
+                    let flushed = 0;
                     while (state.messageQueue.length > 0) {
                         const msg = state.messageQueue.shift();
-                        
-                        const isAudioChunk = msg.clientMsg && msg.clientMsg.realtimeInput && 
-                                             (msg.clientMsg.realtimeInput.audio || msg.clientMsg.realtimeInput.mediaChunks);
-                        
-                        if (isAudioChunk) {
-                            droppedAudioChunks++;
-                            continue;
-                        }
-                        
-                        console.log(`[Relay] Flushing buffered message (${msg.data.length} bytes)`);
                         ws.send(msg.data, { binary: msg.isBinary });
+                        flushed++;
                     }
-                    
-                    if (droppedAudioChunks > 0) {
-                        console.log(`🗑️ Dropped ${droppedAudioChunks} stale audio chunks from queue after reconnect`);
-                    }
+                    console.log(`[Relay] Flushed ${flushed} buffered frame(s) into the new session`);
                     clientWs.send(messageStr);
                     return;
                 }
@@ -555,7 +686,8 @@ wss.on('connection', (clientWs, request, decision) => {
                     const responseTokens = usage.responseTokenCount ?? 0;
                     const totalTokens = usage.totalTokenCount ?? (promptTokens + responseTokens);
                     state.usageTotal += totalTokens;
-                    console.log(`[USAGE] clientId=${clientWs._id} prompt=${promptTokens} response=${responseTokens} total=${totalTokens} modalities=${summarizeUsageDetails(usage)}`);
+                    limits.noteUsage(clientWs._tenantId || '', { promptTokens, responseTokens, totalTokens });
+                    console.log(`[USAGE] clientId=${clientWs._id} device=${clientWs._tenantId || 'unpaired'} prompt=${promptTokens} response=${responseTokens} total=${totalTokens} modalities=${summarizeUsageDetails(usage)}`);
                 }
 
                 // Log transcription wherever Gemini puts it — top level or inside serverContent
@@ -567,7 +699,7 @@ wss.on('connection', (clientWs, request, decision) => {
                         state.heardFresh = false;
                     }
                     state.lastHeard = appendHeard(state.lastHeard, inputTx.text);
-                    console.log(`🎙️ [GEMINI HEARD]: "${inputTx.text}"`);
+                    console.log(`🎙️ [GEMINI HEARD]: "${maskText(inputTx.text)}"`);
                     const echoTerms = countVocabEcho(inputTx.text, state.vocabTerms);
                     if (echoTerms >= VOCAB_ECHO_MIN_TERMS) {
                         console.log(`[VOCAB-ECHO] heard="${inputTx.text.slice(0, 80)}" terms=${echoTerms}`);
@@ -587,7 +719,7 @@ wss.on('connection', (clientWs, request, decision) => {
                             const call = part.executableCalls[0];
                             if (call.name === "search_contacts") {
                                 const name = call.args?.name || "Unknown";
-                                console.log(`${BLUE}🔵 [SNIFFER] Detected tool_call 'search_contacts' for: ${name}${RESET}`);
+                                console.log(`${BLUE}🔵 [SNIFFER] Detected tool_call 'search_contacts' for: ${maskText(name)}${RESET}`);
                             }
                         }
 
@@ -601,8 +733,8 @@ wss.on('connection', (clientWs, request, decision) => {
 
                 // [TOP-LEVEL TOOL CALL] Gemini sends toolCall at root level
                 if (aiMsg.toolCall) {
-                    console.log(`${YELLOW}🟡 [GEMINI -> RELAY] Prettified toolCall:\n${JSON.stringify(aiMsg.toolCall, null, 2)}${RESET}`);
                     const calls = aiMsg.toolCall.functionCalls || [];
+                    console.log(`${YELLOW}🟡 [GEMINI -> RELAY] toolCall: ${calls.map(c => `${c.name}(${JSON.stringify(maskArgs(c.args))})`).join(', ')}${RESET}`);
                     for (const call of calls) {
                         if (call.name === "search_contacts" || call.name === "send_text_message") {
                             const passed = (call.name === "search_contacts"
@@ -613,7 +745,7 @@ wss.on('connection', (clientWs, request, decision) => {
                         }
                         if (call.name === "search_contacts") {
                             const name = call.args?.name || "Unknown";
-                            console.log(`${BLUE}🔵 [SNIFFER] Detected toolCall 'search_contacts' for: ${name}${RESET}`);
+                            console.log(`${BLUE}🔵 [SNIFFER] Detected toolCall 'search_contacts' for: ${maskText(name)}${RESET}`);
                         }
                     }
                     state.heardFresh = true;
@@ -627,30 +759,39 @@ wss.on('connection', (clientWs, request, decision) => {
             }
         });
 
+        // An upstream close is never re-dialled on its own — the next activityStart opens a fresh
+        // session. Reconnecting here is what burned quota on a phone nobody was talking to.
+        let openFailureCounted = false;
+        function countOpenFailure() {
+            if (openFailureCounted || state.setupCompleteReceived) return;
+            openFailureCounted = true;
+            const outcome = limits.noteFailure(clientWs._tenantId || '');
+            console.log(`${RED}[LIMIT] Gemini open failed device=${clientWs._tenantId || 'unpaired'} streak=${outcome.failures} hardStopped=${outcome.hardStopped}${RESET}`);
+        }
+
         ws.on('close', (code, reason) => {
             console.log(`${RED}🔴 [GEMINI -> ERROR] Connection Closed (${code}): ${reason}${RESET}`);
-            if (clientWs.readyState === WebSocket.OPEN) {
-                clientWs.send(JSON.stringify({
-                    type: "error",
-                    error: { message: "AI service disconnected", code: "GEMINI_DISCONNECT" }
-                }));
-            }
-            // Only reconnect if this closed connection is STILL the
-            // current active one — prevents a stale/already-replaced
-            // connection's close event from triggering a second,
-            // redundant reconnect
-            if (state.geminiWs === ws && !state.reconnecting) {
-                state.reconnecting = true;
-                console.log(`${YELLOW}🟡 [RELAY] Attempting Gemini reconnect...${RESET}`);
-                setTimeout(() => {
-                    state.reconnecting = false;
-                    connectToGemini(true);
-                }, 500);
+            countOpenFailure();
+            const wasCurrent = state.geminiWs === ws;
+            if (wasCurrent) {
+                state.geminiWs = null;
+                state.setupCompleteReceived = false;
+                state.messageQueue.length = 0;
+                endLiveSession();
+                cancelIdleTeardown();
+                // Speak only if this was the session the Tester is waiting on.
+                if (clientWs.readyState === WebSocket.OPEN) {
+                    clientWs.send(JSON.stringify({
+                        type: "error",
+                        error: { message: "AI service disconnected", code: "GEMINI_DISCONNECT" }
+                    }));
+                }
             }
         });
 
         ws.on('error', (err) => {
             console.error(`${RED}🔴 [GEMINI -> ERROR] WebSocket Error: ${err.message}${RESET}`);
+            countOpenFailure();
         });
     }
 
@@ -672,13 +813,17 @@ wss.on('connection', (clientWs, request, decision) => {
     }
 
     function traceToolCall(heard, passed, fn) {
-        console.log(`[NAME-TRACE] fn=${fn} heard="${heard}" | passed="${passed}"`);
+        const mask = typeof maskText === 'function' ? maskText : (s) => s;
+        const isProbe = clientWs && clientWs._id === 'probe';
+        const displayHeard = isProbe ? heard : mask(heard);
+        const displayPassed = isProbe ? passed : mask(passed);
+        console.log(`[NAME-TRACE] fn=${fn} heard="${displayHeard}" | passed="${displayPassed}"`);
         writeNameTrace({
             timestamp: new Date().toISOString(),
             clientId: clientWs._id,
             fn,
-            heard,
-            passed,
+            heard: displayHeard,
+            passed: displayPassed,
             result: null,
             matched: null
         });
@@ -704,9 +849,12 @@ wss.on('connection', (clientWs, request, decision) => {
     function traceToolResponse(responseMap, fn) {
         const map = typeof responseMap === "string" ? { result: responseMap } : (responseMap || {});
         const result = map.result || "UNKNOWN";
+        const mask = typeof maskText === 'function' ? maskText : (s) => s;
+        const tag = typeof maskId === 'function' ? maskId(clientWs._tenantId) : (clientWs._tenantId || 'unidentified');
 
         if (NON_CONVERSATIONAL_FNS.has(fn)) {
             console.log(`[NAME-TRACE] fn=${fn} result=${result}`);
+            console.log(`[METRIC] event=task_result device=${tag} fn=${fn} result=${result}`);
             writeNameTrace({
                 timestamp: new Date().toISOString(),
                 clientId: clientWs._id,
@@ -716,26 +864,33 @@ wss.on('connection', (clientWs, request, decision) => {
             return;
         }
 
+        const isProbe = clientWs && clientWs._id === 'probe';
         const matched = map.name || "-";
         const candidates = Array.isArray(map.matches) && map.matches.length ? map.matches : null;
         const query = map.query || null;
 
-        console.log(`[NAME-TRACE] fn=${fn || "unknown"} result=${result} matched="${matched}"` +
-            (candidates ? ` candidates=${JSON.stringify(candidates)}` : ""));
+        const displayMatched = isProbe || !matched || matched === '-' ? matched : mask(matched);
+        const displayCandidates = candidates ? (isProbe ? candidates : candidates.map(mask)) : null;
+        const displayQuery = query ? (isProbe ? query : mask(query)) : null;
+
+        console.log(`[NAME-TRACE] fn=${fn || "unknown"} result=${result} matched="${displayMatched}"` +
+            (displayCandidates ? ` candidates=${JSON.stringify(displayCandidates)}` : ""));
+        console.log(`[METRIC] event=task_result device=${tag} fn=${fn || "unknown"} result=${result}`);
         writeNameTrace({
             timestamp: new Date().toISOString(),
             clientId: clientWs._id,
             fn: fn || null,
-            heard: state.lastHeard || "",
-            passed: state.lastPassed || "",
+            heard: isProbe ? (state.lastHeard || "") : mask(state.lastHeard || ""),
+            passed: isProbe ? (state.lastPassed || "") : mask(state.lastPassed || ""),
             result,
-            matched,
-            ...(candidates ? { candidates } : {}),
-            ...(query ? { query } : {})
+            matched: displayMatched,
+            ...(displayCandidates ? { candidates: displayCandidates } : {}),
+            ...(displayQuery ? { query: displayQuery } : {})
         });
     }
 
-    connectToGemini(false);
+    // No eager connect: an idle app used to hold a Gemini session open, which is what burned the
+    // free tier. The first activityStart opens it; activityEnd plus the idle window closes it.
 
     clientWs.on('ping', () => {
         clientWs._lastSeen = Date.now();
@@ -801,6 +956,16 @@ wss.on('connection', (clientWs, request, decision) => {
             }
         }
 
+        // Push-to-talk owns the session: a press opens Gemini, a release starts the idle window.
+        // Audio also opens it, so a build that never sends activityStart still works.
+        const ri = isJson ? clientMsg?.realtimeInput : null;
+        const isAudioIn = !isJson || Boolean(ri && (ri.audio || ri.mediaChunks));
+        if (ri?.activityStart) cancelIdleTeardown();
+        if (ri?.activityStart || isAudioIn) {
+            if (!ensureGemini()) return;
+        }
+        if (ri?.activityEnd) scheduleIdleTeardown();
+
         if (!state.geminiWs || state.geminiWs.readyState !== WebSocket.OPEN || !state.setupCompleteReceived) {
             state.messageQueue.push({ data: messageStr, isBinary: !isJson, clientMsg: clientMsg });
             return;
@@ -830,6 +995,12 @@ wss.on('connection', (clientWs, request, decision) => {
                         }
                         const rms = Math.sqrt(sum / (buffer.length / 2));
                         console.log(`🎤 [CLIENT -> RELAY] RMS: ${rms.toFixed(2)} | B64: ${data.length} | Forwarding: realtimeInput.audio`);
+                        const spent = limits.noteAudio(clientWs._tenantId || '', pcmDurationMs(buffer.length, clientMsg.realtimeInput.audio.mimeType));
+                        if (spent.exhausted) {
+                            teardownGemini('daily_audio_exhausted');
+                            speakLimit(REASON.DAILY_AUDIO);
+                            return;
+                        }
                     }
                     state.geminiWs.send(messageStr);
                     return;
@@ -890,6 +1061,12 @@ wss.on('connection', (clientWs, request, decision) => {
                 console.error(`[Relay] Error handling client JSON: ${e.message}`);
             }
         } else {
+            const spent = limits.noteAudio(clientWs._tenantId || '', pcmDurationMs(message.length));
+            if (spent.exhausted) {
+                teardownGemini('daily_audio_exhausted');
+                speakLimit(REASON.DAILY_AUDIO);
+                return;
+            }
             state.geminiWs.send(message, { binary: true });
         }
     });
@@ -897,15 +1074,14 @@ wss.on('connection', (clientWs, request, decision) => {
     clientWs.on('close', () => {
         console.log(`[Handshake] Client ${clientWs._id} Disconnected`);
         console.log(`[RELAY] CLIENT DISCONNECT: id=${clientWs._id}`);
-        console.log(`[USAGE-SESSION] clientId=${clientWs._id} total=${state.usageTotal} reconnects=${state.reconnectCount}`);
+        console.log(`[USAGE-SESSION] clientId=${clientWs._id} device=${clientWs._tenantId || 'unpaired'} total=${state.usageTotal} opens=${state.sessionOpens}`);
         if (clientWs._tenantId) {
             tenancy.releaseLease(clientWs._tenantId, clientWs._id);
             console.log(`[Tenancy] Lease released for device=${clientWs._tenantId}`);
         }
-        if (state.geminiWs) {
-            state.geminiWs.removeAllListeners();
-            state.geminiWs.close();
-        }
+        teardownGemini('client_disconnected');
+        // Audio and token counters are debounced; a disconnect must not lose the last second.
+        limits.flush();
     });
 });
 
@@ -949,4 +1125,7 @@ server.listen(PORT, '0.0.0.0', () => {
     console.log(`${GREEN}   Model: ${GEMINI_MODEL_PATH} | Tool behavior: ${TOOL_BEHAVIOR}${RESET}`);
     console.log(`   Tenancy: ${TENANCY_ENFORCED ? "ENFORCED" : "disabled (all clients served)"} | data dir: ${PILOT_DATA_DIR} | lease ttl: ${LEASE_TTL_MS}ms`);
     console.log(`   Admin panel: ${ADMIN_PANEL_ENABLED ? `on ${ADMIN_BASE}` : "disabled"}`);
+    const snap = limits.snapshot();
+    console.log(`   Limits: ${snap.maxLiveSessions} live Gemini sessions | ${snap.globalDailyOpenLimit} opens/day project-wide | ${snap.dailyOpenLimit} opens + ${snap.dailyAudioMinutes} audio min/day per Tester`);
+    console.log(`   Session: opened on activityStart, torn down ${snap.idleTeardownMs}ms after activityEnd | day resets at UTC${snap.dayOffsetMinutes >= 0 ? '+' : ''}${snap.dayOffsetMinutes / 60} | usage store: ${limits.filePath}`);
 });

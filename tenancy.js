@@ -193,6 +193,7 @@ function createTenancy(options = {}) {
             reason: issueToken ? 'token_issued' : 'approved',
             deviceId,
             testerName: rec.testerName,
+            appVersion: rec.appVersion || appVersion,
             issueToken,
         };
     }
