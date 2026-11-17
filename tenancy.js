@@ -109,6 +109,23 @@ function createTenancy(options = {}) {
         const appVersion = String(headers.appVersion || '').trim();
 
         if (!enforced) {
+            if (deviceId && DEVICE_ID_PATTERN.test(deviceId)) {
+                let rec = data.devices[deviceId];
+                if (!rec) {
+                    rec = noteDevice(deviceId, { appVersion, signatureHash, status: STATUS.APPROVED });
+                    save();
+                } else {
+                    noteDevice(deviceId, { appVersion: appVersion || rec.appVersion });
+                    save();
+                    if (rec.status === STATUS.PAUSED) {
+                        return { action: 'refuse', closeCode: CLOSE.PAUSED, reason: 'paused', deviceId, testerName: rec.testerName };
+                    }
+                    if (rec.status === STATUS.REVOKED) {
+                        return { action: 'refuse', closeCode: CLOSE.REVOKED, reason: 'revoked', deviceId, testerName: rec.testerName };
+                    }
+                }
+                return { action: 'serve', reason: 'tenancy_disabled', deviceId, testerName: rec.testerName || '', appVersion: rec.appVersion };
+            }
             return { action: 'serve', reason: 'tenancy_disabled', deviceId: '', testerName: '' };
         }
 

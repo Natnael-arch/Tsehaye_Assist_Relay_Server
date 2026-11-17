@@ -327,7 +327,10 @@
   </div>
 
   <!-- Testers table -->
-  <div class="section-title">Testers</div>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <div class="section-title" style="margin-bottom:0">Testers</div>
+    <button class="btn btn-ghost btn-sm" onclick="openAddTesterModal()">+ Pre-register Tester</button>
+  </div>
   <div class="table-wrap">
     <table>
       <thead>
@@ -359,18 +362,22 @@
   </div>
 </div>
 
-<!-- ═══════════════════ APPROVE MODAL ═══════════════════ -->
+<!-- ═══════════════════ APPROVE / REGISTER MODAL ═══════════════════ -->
 <div class="modal-bg" id="approve-modal">
   <div class="modal">
-    <h2>Approve Tester</h2>
+    <h2 id="modal-title">Approve Tester</h2>
+    <div id="approve-device-row" style="display:none">
+      <label>Device ID (from Android logcat or phone)</label>
+      <input id="approve-device-input" type="text" placeholder="e.g. 9b167b5258d9bafe" />
+    </div>
     <div>
       <label>Tester name (shown in logs and billing)</label>
-      <input id="approve-name" type="text" placeholder="e.g. Kebede" />
+      <input id="approve-name" type="text" placeholder="e.g. Tester 1 (Dave)" />
     </div>
     <div style="font-size:.78rem;color:var(--muted)" id="approve-device-label"></div>
     <div class="modal-actions">
       <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-green" onclick="confirmApprove()">Approve</button>
+      <button class="btn btn-green" id="modal-submit-btn" onclick="confirmApprove()">Save</button>
     </div>
   </div>
 </div>
@@ -519,6 +526,9 @@ function updateDevices(data) {
     const name       = d.testerName || `<em style="color:var(--muted)">unnamed</em>`;
     const devShort   = d.deviceId ? d.deviceId.slice(0, 12) + '…' : '—';
 
+    const isOnline = Boolean(d.online);
+    const onlineBadge = isOnline ? `<span class="badge" style="background:#064e3b;color:#6ee7b7;margin-left:6px">● live</span>` : '';
+
     const badge = {
       approved: `<span class="badge badge-approved">approved</span>`,
       pending:  `<span class="badge badge-pending">pending</span>`,
@@ -530,7 +540,7 @@ function updateDevices(data) {
 
     return `<tr>
       <td>
-        <div>${name}</div>
+        <div>${name} ${onlineBadge}</div>
         <div style="font-size:.72rem;color:var(--muted);font-family:monospace">${devShort}</div>
       </td>
       <td>${badge}</td>
@@ -549,6 +559,7 @@ function buildActions(d) {
     btns.push(`<button class="btn btn-green btn-sm" onclick="openApprove('${id}', '${esc(d.testerName)}')">Approve</button>`);
   }
   if (d.status === 'approved') {
+    btns.push(`<button class="btn btn-ghost btn-sm" onclick="openApprove('${id}', '${esc(d.testerName)}')">Rename</button>`);
     btns.push(`<button class="btn btn-yellow btn-sm" onclick="act('${id}','pause')">Pause</button>`);
     btns.push(`<button class="btn btn-red btn-sm" onclick="act('${id}','revoke')">Revoke</button>`);
   }
@@ -625,10 +636,23 @@ async function act(deviceId, action) {
 // ── Approve modal ──────────────────────────────────────
 function openApprove(deviceId, existingName) {
   pendingApproveId = deviceId;
+  document.getElementById('modal-title').textContent = existingName ? 'Edit Tester Name' : 'Approve Tester';
+  document.getElementById('approve-device-row').style.display = 'none';
   document.getElementById('approve-name').value = existingName || '';
   document.getElementById('approve-device-label').textContent = `Device: ${deviceId}`;
   document.getElementById('approve-modal').classList.add('open');
   setTimeout(() => document.getElementById('approve-name').focus(), 60);
+}
+
+function openAddTesterModal() {
+  pendingApproveId = null;
+  document.getElementById('modal-title').textContent = 'Pre-register Tester';
+  document.getElementById('approve-device-row').style.display = 'block';
+  document.getElementById('approve-device-input').value = '';
+  document.getElementById('approve-name').value = '';
+  document.getElementById('approve-device-label').textContent = '';
+  document.getElementById('approve-modal').classList.add('open');
+  setTimeout(() => document.getElementById('approve-device-input').focus(), 60);
 }
 
 function closeModal() {
@@ -638,14 +662,21 @@ function closeModal() {
 
 async function confirmApprove() {
   const name = document.getElementById('approve-name').value.trim();
-  if (!name) { document.getElementById('approve-name').focus(); return; }
+  let devId = pendingApproveId;
+  if (!devId) {
+    devId = document.getElementById('approve-device-input').value.trim();
+    if (!devId) {
+      document.getElementById('approve-device-input').focus();
+      return;
+    }
+  }
   closeModal();
   try {
-    const r = await apiFetch(`/admin/devices/${pendingApproveId}/approve`, 'POST', { testerName: name });
+    const r = await apiFetch(`/admin/devices/${devId}/approve`, 'POST', { testerName: name });
     const json = await r.json().catch(() => ({}));
     if (r.ok && json.ok !== false) {
-      toast(`✓ ${name} approved`);
-      addLog('ok', `Approved: ${name} → ${pendingApproveId.slice(0, 12)}`);
+      toast(`✓ ${name || devId} saved`);
+      addLog('ok', `Saved tester: ${name || devId} (${devId.slice(0, 12)})`);
     } else {
       toast(`✗ ${json.error || 'Approve failed'}`);
       addLog('err', `Approve failed: ${json.error}`);

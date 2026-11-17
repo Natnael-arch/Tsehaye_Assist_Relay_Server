@@ -315,7 +315,17 @@ function adminAct(res, result) {
 app.use(ADMIN_BASE, express.json({ limit: '4kb' }));
 
 app.get(`${ADMIN_BASE}/devices`, requireAdmin, (req, res) => {
-    const devices = tenancy.listDevices().map((d) => ({ ...d, usage: limits.usageFor(d.deviceId) }));
+    const activeDeviceIds = new Set();
+    for (const client of wss.clients) {
+        if (client._tenantId && client.readyState === WebSocket.OPEN) {
+            activeDeviceIds.add(client._tenantId);
+        }
+    }
+    const devices = tenancy.listDevices().map((d) => ({
+        ...d,
+        online: activeDeviceIds.has(d.deviceId),
+        usage: limits.usageFor(d.deviceId)
+    }));
     res.json({ enforced: tenancy.enforced, lease_ttl_ms: LEASE_TTL_MS, connections: wss.clients.size, devices });
 });
 
