@@ -4,6 +4,7 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const fs = require('fs');
+const path = require('path');
 const crypto = require('crypto');
 const { createTenancy, CLOSE } = require('./tenancy');
 const { createLimits, REASON, pcmDurationMs } = require('./limits');
@@ -59,7 +60,7 @@ const PILOT_DATA_DIR = (() => {
     return fs.existsSync('/data') ? '/data' : '.';
 })();
 const TENANCY_ENFORCED = (process.env.TENANCY_ENFORCED || "0") === "1";
-const ADMIN_PANEL_ENABLED = (process.env.ADMIN_PANEL_ENABLED || "0") === "1";
+const ADMIN_PANEL_ENABLED = (process.env.ADMIN_PANEL_ENABLED || "1") === "1"; // dashboard is live; set to 0 to disable admin API
 const ADMIN_PATH = process.env.ADMIN_PATH || "/admin";
 const LEASE_TTL_MS = Number.parseInt(process.env.LEASE_TTL_MS || "75000", 10);
 
@@ -329,6 +330,13 @@ app.post(`${ADMIN_BASE}/devices/:id/pause`, requireAdmin, (req, res) => adminAct
 app.post(`${ADMIN_BASE}/devices/:id/resume`, requireAdmin, (req, res) => adminAct(res, tenancy.resume(req.params.id)));
 app.post(`${ADMIN_BASE}/devices/:id/revoke`, requireAdmin, (req, res) => adminAct(res, tenancy.revoke(req.params.id)));
 app.post(`${ADMIN_BASE}/devices/:id/forget`, requireAdmin, (req, res) => adminAct(res, tenancy.forget(req.params.id)));
+
+// ═ ADMIN DASHBOARD ═ served at /admin/dashboard
+// No middleware: the HTML page authenticates via ADMIN_KEY entered in the browser,
+// which then calls the requireAdmin-protected API endpoints normally.
+app.get(`${ADMIN_BASE}/dashboard`, (req, res) => {
+    res.sendFile(path.join(__dirname, 'admin-dashboard.html'));
+});
 
 // ═══════════════════════════════════════
 // WEBSOCKET UPGRADE HANDLER

@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Tsehay Assist — Pilot Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --border: #2a2d3a;
+    --accent: #4f9cf9;
+    --green: #22c55e;
+    --yellow: #f59e0b;
+    --red: #ef4444;
+    --muted: #6b7280;
+    --text: #e5e7eb;
+    --text-dim: #9ca3af;
+    --radius: 10px;
+    --font: 'Segoe UI', system-ui, sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    min-height: 100vh;
+    padding: 24px 16px;
+  }
+
+  /* ── Lock screen ── */
+  #lock-screen {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 90vh;
+    gap: 20px;
+  }
+  #lock-screen h1 { font-size: 1.5rem; }
+  #lock-screen p { color: var(--text-dim); font-size: 0.9rem; }
+  #lock-form { display: flex; gap: 10px; width: 100%; max-width: 440px; }
+  #lock-key {
+    flex: 1;
+    padding: 10px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    font-size: 0.95rem;
+  }
+  #lock-key:focus { outline: 2px solid var(--accent); }
+  #lock-err { color: var(--red); font-size: 0.85rem; min-height: 18px; }
+
+  /* ── Main layout ── */
+  #app { display: none; max-width: 960px; margin: 0 auto; }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 28px;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 1.3rem; font-weight: 700; }
+  header .sub { color: var(--text-dim); font-size: 0.82rem; margin-top: 2px; }
+  .header-right { display: flex; gap: 10px; align-items: center; }
+
+  /* ── Buttons ── */
+  .btn {
+    padding: 7px 14px;
+    border-radius: 7px;
+    border: none;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity .15s;
+  }
+  .btn:hover { opacity: .82; }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-ghost { background: var(--surface); color: var(--text-dim); border: 1px solid var(--border); }
+  .btn-green  { background: #166534; color: #86efac; }
+  .btn-yellow { background: #78350f; color: #fde68a; }
+  .btn-red    { background: #7f1d1d; color: #fca5a5; }
+  .btn-sm     { padding: 5px 10px; font-size: 0.75rem; }
+
+  /* ── Cards row ── */
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 14px;
+    margin-bottom: 28px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px 20px;
+  }
+  .card-label { font-size: 0.75rem; color: var(--text-dim); letter-spacing: .04em; text-transform: uppercase; }
+  .card-value { font-size: 1.9rem; font-weight: 700; margin-top: 4px; line-height: 1; }
+  .card-sub   { font-size: 0.75rem; color: var(--text-dim); margin-top: 4px; }
+  .dot {
+    display: inline-block;
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    margin-right: 6px;
+  }
+  .dot-green  { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot-yellow { background: var(--yellow); }
+  .dot-red    { background: var(--red); }
+
+  /* ── Section header ── */
+  .section-title {
+    font-size: 0.8rem;
+    font-weight: 700;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    margin-bottom: 10px;
+  }
+
+  /* ── Testers table ── */
+  .table-wrap {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    margin-bottom: 28px;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left;
+    padding: 10px 16px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  td {
+    padding: 12px 16px;
+    font-size: 0.85rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(255,255,255,.025); }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: .03em;
+  }
+  .badge-approved { background: #14532d; color: #86efac; }
+  .badge-pending  { background: #78350f; color: #fde68a; }
+  .badge-paused   { background: #1e3a5f; color: #93c5fd; }
+  .badge-revoked  { background: #450a0a; color: #fca5a5; }
+
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+  /* ── Approve modal ── */
+  .modal-bg {
+    display: none;
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,.7);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+  }
+  .modal-bg.open { display: flex; }
+  .modal {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 28px;
+    width: 100%;
+    max-width: 400px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .modal h2 { font-size: 1.05rem; }
+  .modal label { font-size: 0.82rem; color: var(--text-dim); }
+  .modal input {
+    width: 100%;
+    padding: 9px 12px;
+    border-radius: 7px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.9rem;
+    margin-top: 4px;
+  }
+  .modal input:focus { outline: 2px solid var(--accent); }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+
+  /* ── Usage section ── */
+  .usage-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 14px;
+    margin-bottom: 28px;
+  }
+  .usage-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+  }
+  .usage-card .label { font-size: 0.72rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: .04em; }
+  .usage-card .val   { font-size: 1.3rem; font-weight: 700; margin-top: 2px; }
+  .usage-card .sub   { font-size: 0.72rem; color: var(--text-dim); margin-top: 2px; }
+
+  /* ── Toast ── */
+  #toast {
+    position: fixed;
+    bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: #18181b;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px 20px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    opacity: 0;
+    transition: opacity .25s;
+    pointer-events: none;
+    z-index: 200;
+    white-space: nowrap;
+  }
+  #toast.show { opacity: 1; }
+
+  /* ── Empty state ── */
+  .empty {
+    text-align: center;
+    color: var(--text-dim);
+    padding: 36px 16px;
+    font-size: 0.88rem;
+  }
+
+  /* ── Log section ── */
+  .log-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    font-family: monospace;
+    font-size: 0.78rem;
+    color: var(--text-dim);
+    max-height: 160px;
+    overflow-y: auto;
+    line-height: 1.6;
+  }
+  .log-box .ok   { color: var(--green); }
+  .log-box .warn { color: var(--yellow); }
+  .log-box .err  { color: var(--red); }
+
+  @media (max-width: 540px) {
+    th:nth-child(3), td:nth-child(3),
+    th:nth-child(5), td:nth-child(5) { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════ LOCK SCREEN ═══════════════════ -->
+<div id="lock-screen">
+  <div style="font-size:2rem">🔑</div>
+  <h1>Tsehay Assist Dashboard</h1>
+  <p>Enter your admin key to continue</p>
+  <div id="lock-form">
+    <input id="lock-key" type="password" placeholder="Admin key…" autocomplete="off" />
+    <button class="btn btn-primary" onclick="unlock()">Unlock</button>
+  </div>
+  <div id="lock-err"></div>
+</div>
+
+<!-- ═══════════════════ MAIN APP ═══════════════════ -->
+<div id="app">
+  <header>
+    <div>
+      <h1>🛰 Tsehay Assist — Pilot Dashboard</h1>
+      <div class="sub" id="relay-url"></div>
+    </div>
+    <div class="header-right">
+      <span id="relay-status" style="font-size:.82rem"></span>
+      <button class="btn btn-ghost" onclick="refresh()">↺ Refresh</button>
+      <button class="btn btn-ghost" onclick="lockOut()">Lock</button>
+    </div>
+  </header>
+
+  <!-- Summary cards -->
+  <div class="cards">
+    <div class="card">
+      <div class="card-label">Relay</div>
+      <div class="card-value" id="c-relay">—</div>
+      <div class="card-sub" id="c-uptime">uptime —</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Live Sessions</div>
+      <div class="card-value" id="c-live">—</div>
+      <div class="card-sub" id="c-cap">of — max</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Today's Opens</div>
+      <div class="card-value" id="c-opens">—</div>
+      <div class="card-sub" id="c-opens-cap">of — limit</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Audio Minutes Today</div>
+      <div class="card-value" id="c-audio">—</div>
+      <div class="card-sub">project-wide</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Testers</div>
+      <div class="card-value" id="c-testers">—</div>
+      <div class="card-sub" id="c-pending"></div>
+    </div>
+  </div>
+
+  <!-- Testers table -->
+  <div class="section-title">Testers</div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Name / Device</th>
+          <th>Status</th>
+          <th>Opens today</th>
+          <th>Audio min</th>
+          <th>Last seen</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="tester-rows">
+        <tr><td colspan="6"><div class="empty">Loading…</div></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Usage breakdown -->
+  <div class="section-title">Usage Snapshot</div>
+  <div class="usage-grid" id="usage-grid">
+    <div class="usage-card"><div class="label">Loading…</div></div>
+  </div>
+
+  <!-- Activity log -->
+  <div class="section-title" style="margin-bottom:8px">Activity Log</div>
+  <div class="log-box" id="log-box">
+    <div>Connecting…</div>
+  </div>
+</div>
+
+<!-- ═══════════════════ APPROVE MODAL ═══════════════════ -->
+<div class="modal-bg" id="approve-modal">
+  <div class="modal">
+    <h2>Approve Tester</h2>
+    <div>
+      <label>Tester name (shown in logs and billing)</label>
+      <input id="approve-name" type="text" placeholder="e.g. Kebede" />
+    </div>
+    <div style="font-size:.78rem;color:var(--muted)" id="approve-device-label"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-green" onclick="confirmApprove()">Approve</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════ TOAST ═══════════════════ -->
+<div id="toast"></div>
+
+<script>
+// ── State ──────────────────────────────────────────────
+let API_KEY = '';
+let BASE = window.location.origin;
+let autoTimer = null;
+let pendingApproveId = null;
+const logs = [];
+
+// ── Lock / Unlock ──────────────────────────────────────
+document.getElementById('lock-key').addEventListener('keydown', e => {
+  if (e.key === 'Enter') unlock();
+});
+
+async function unlock() {
+  const key = document.getElementById('lock-key').value.trim();
+  if (!key) return;
+  document.getElementById('lock-err').textContent = '';
+
+  try {
+    const r = await apiFetch('/admin/devices', 'GET', null, key);
+    if (r.status === 401) {
+      document.getElementById('lock-err').textContent = 'Wrong admin key.';
+      return;
+    }
+    if (!r.ok) {
+      document.getElementById('lock-err').textContent = `Server error ${r.status}`;
+      return;
+    }
+    API_KEY = key;
+    // Persist key for the tab session only
+    sessionStorage.setItem('tsehay_admin_key', key);
+    showApp();
+  } catch (e) {
+    document.getElementById('lock-err').textContent = 'Could not reach the relay.';
+  }
+}
+
+function lockOut() {
+  API_KEY = '';
+  sessionStorage.removeItem('tsehay_admin_key');
+  clearInterval(autoTimer);
+  document.getElementById('app').style.display = 'none';
+  document.getElementById('lock-screen').style.display = 'flex';
+  document.getElementById('lock-key').value = '';
+}
+
+function showApp() {
+  document.getElementById('lock-screen').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  document.getElementById('relay-url').textContent = BASE;
+  refresh();
+  autoTimer = setInterval(refresh, 8000);
+}
+
+// ── Auto-restore session ───────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  const saved = sessionStorage.getItem('tsehay_admin_key');
+  if (saved) {
+    document.getElementById('lock-key').value = saved;
+    API_KEY = saved;
+    showApp();
+  }
+});
+
+// ── API helpers ────────────────────────────────────────
+async function apiFetch(path, method = 'GET', body = null, key = null) {
+  const headers = { 'Authorization': `Bearer ${key || API_KEY}` };
+  if (body) headers['Content-Type'] = 'application/json';
+  return fetch(BASE + path, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined
+  });
+}
+
+// ── Main refresh ───────────────────────────────────────
+async function refresh() {
+  try {
+    const [healthRes, devicesRes, usageRes] = await Promise.all([
+      fetch(BASE + '/health'),
+      apiFetch('/admin/devices'),
+      apiFetch('/admin/usage')
+    ]);
+
+    const health  = healthRes.ok  ? await healthRes.json()  : null;
+    const devData = devicesRes.ok ? await devicesRes.json() : null;
+    const usage   = usageRes.ok   ? await usageRes.json()   : null;
+
+    updateHealth(health);
+    updateDevices(devData);
+    updateUsage(usage, devData);
+
+    setRelayStatus(true);
+  } catch (e) {
+    setRelayStatus(false);
+    addLog('err', `Refresh failed: ${e.message}`);
+  }
+}
+
+// ── Health card ────────────────────────────────────────
+function updateHealth(h) {
+  if (!h) return;
+  const upSec = h.uptime_sec || 0;
+  document.getElementById('c-relay').innerHTML = `<span class="dot dot-green"></span>OK`;
+  document.getElementById('c-uptime').textContent = `uptime ${fmtDuration(upSec)}`;
+  document.getElementById('c-live').textContent = h.connections ?? '—';
+}
+
+function setRelayStatus(ok) {
+  const el = document.getElementById('relay-status');
+  el.innerHTML = ok
+    ? `<span class="dot dot-green"></span>Online`
+    : `<span class="dot dot-red"></span>Offline`;
+}
+
+// ── Devices table ──────────────────────────────────────
+function updateDevices(data) {
+  if (!data) return;
+  const devices = data.devices || [];
+  const tbody = document.getElementById('tester-rows');
+
+  // Summary cards
+  const approved = devices.filter(d => d.status === 'approved').length;
+  const pending  = devices.filter(d => d.status === 'pending').length;
+  document.getElementById('c-testers').textContent = approved;
+  document.getElementById('c-pending').textContent = pending ? `${pending} pending approval` : 'none pending';
+  document.getElementById('c-cap').textContent = `of ${data.lease_ttl_ms ? '3' : '3'} max`;
+
+  if (devices.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="6"><div class="empty">No phones have connected yet. Install the APK and open the app.</div></td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = devices.map(d => {
+    const u = d.usage || {};
+    const opensToday = u.dailyOpens ?? '—';
+    const audioMin   = u.audioMinutesToday != null ? u.audioMinutesToday.toFixed(1) : '—';
+    const lastSeen   = d.lastSeenAt ? timeSince(d.lastSeenAt) : '—';
+    const name       = d.testerName || `<em style="color:var(--muted)">unnamed</em>`;
+    const devShort   = d.deviceId ? d.deviceId.slice(0, 12) + '…' : '—';
+
+    const badge = {
+      approved: `<span class="badge badge-approved">approved</span>`,
+      pending:  `<span class="badge badge-pending">pending</span>`,
+      paused:   `<span class="badge badge-paused">paused</span>`,
+      revoked:  `<span class="badge badge-revoked">revoked</span>`,
+    }[d.status] || `<span class="badge">${d.status}</span>`;
+
+    const actions = buildActions(d);
+
+    return `<tr>
+      <td>
+        <div>${name}</div>
+        <div style="font-size:.72rem;color:var(--muted);font-family:monospace">${devShort}</div>
+      </td>
+      <td>${badge}</td>
+      <td>${opensToday}</td>
+      <td>${audioMin}</td>
+      <td style="color:var(--muted)">${lastSeen}</td>
+      <td><div class="actions">${actions}</div></td>
+    </tr>`;
+  }).join('');
+}
+
+function buildActions(d) {
+  const id = d.deviceId;
+  const btns = [];
+  if (d.status === 'pending' || d.status === 'revoked') {
+    btns.push(`<button class="btn btn-green btn-sm" onclick="openApprove('${id}', '${esc(d.testerName)}')">Approve</button>`);
+  }
+  if (d.status === 'approved') {
+    btns.push(`<button class="btn btn-yellow btn-sm" onclick="act('${id}','pause')">Pause</button>`);
+    btns.push(`<button class="btn btn-red btn-sm" onclick="act('${id}','revoke')">Revoke</button>`);
+  }
+  if (d.status === 'paused') {
+    btns.push(`<button class="btn btn-green btn-sm" onclick="act('${id}','resume')">Resume</button>`);
+    btns.push(`<button class="btn btn-red btn-sm" onclick="act('${id}','revoke')">Revoke</button>`);
+  }
+  if (d.status === 'revoked') {
+    btns.push(`<button class="btn btn-ghost btn-sm" onclick="act('${id}','forget')" style="color:var(--red)">Forget</button>`);
+  }
+  if (d.usage && d.usage.hardStop) {
+    btns.push(`<button class="btn btn-ghost btn-sm" onclick="act('${id}','clear-hard-stop')" title="Clear 3-failure hard stop">Clear Stop</button>`);
+  }
+  return btns.join('');
+}
+
+// ── Usage section ──────────────────────────────────────
+function updateUsage(usage, devData) {
+  const grid = document.getElementById('usage-grid');
+  if (!usage) { grid.innerHTML = `<div class="usage-card"><div class="label">Usage unavailable</div></div>`; return; }
+
+  const snap = usage;
+  const opensToday = snap.project?.dailyOpens ?? snap.dailyOpens ?? '—';
+  const audioMin   = snap.project?.audioMinutesToday != null ? snap.project.audioMinutesToday.toFixed(1)
+                   : snap.audioMinutesToday != null ? snap.audioMinutesToday.toFixed(1) : '—';
+
+  document.getElementById('c-opens').textContent = opensToday;
+  const globalCap = snap.limits?.globalDailyOpenLimit ?? snap.globalDailyOpenLimit ?? '—';
+  document.getElementById('c-opens-cap').textContent = `of ${globalCap} daily limit`;
+
+  const totalAudioRaw = snap.project?.audioMinutesToday ?? snap.audioMinutesToday ?? 0;
+  document.getElementById('c-audio').textContent = typeof totalAudioRaw === 'number' ? totalAudioRaw.toFixed(1) : '—';
+
+  // Per-tester breakdown
+  const perTester = snap.testers || snap.perTester || {};
+  const cards = Object.entries(perTester).map(([id, s]) => {
+    const device = (devData && devData.devices || []).find(d => d.deviceId === id);
+    const label = device?.testerName || id.slice(0, 10) + '…';
+    const dOpens = s.dailyOpens ?? '—';
+    const dAudio = s.audioMinutesToday != null ? s.audioMinutesToday.toFixed(1) : '—';
+    return `<div class="usage-card">
+      <div class="label">${label}</div>
+      <div class="val">${dOpens} opens</div>
+      <div class="sub">${dAudio} min audio today</div>
+    </div>`;
+  });
+
+  if (cards.length) {
+    grid.innerHTML = cards.join('');
+  } else {
+    grid.innerHTML = `<div class="usage-card"><div class="label">No usage data yet</div><div class="sub">Usage appears once a tester opens the app</div></div>`;
+  }
+}
+
+// ── Tester actions ─────────────────────────────────────
+async function act(deviceId, action) {
+  try {
+    const r = await apiFetch(`/admin/devices/${deviceId}/${action}`, 'POST');
+    const json = await r.json().catch(() => ({}));
+    if (r.ok && (json.ok !== false)) {
+      toast(`✓ ${action} applied`);
+      addLog('ok', `${action} → ${deviceId.slice(0, 12)}`);
+    } else {
+      toast(`✗ ${json.error || 'Failed'}`);
+      addLog('err', `${action} failed: ${json.error || r.status}`);
+    }
+  } catch (e) {
+    toast(`✗ ${e.message}`);
+    addLog('err', `${action} error: ${e.message}`);
+  }
+  refresh();
+}
+
+// ── Approve modal ──────────────────────────────────────
+function openApprove(deviceId, existingName) {
+  pendingApproveId = deviceId;
+  document.getElementById('approve-name').value = existingName || '';
+  document.getElementById('approve-device-label').textContent = `Device: ${deviceId}`;
+  document.getElementById('approve-modal').classList.add('open');
+  setTimeout(() => document.getElementById('approve-name').focus(), 60);
+}
+
+function closeModal() {
+  pendingApproveId = null;
+  document.getElementById('approve-modal').classList.remove('open');
+}
+
+async function confirmApprove() {
+  const name = document.getElementById('approve-name').value.trim();
+  if (!name) { document.getElementById('approve-name').focus(); return; }
+  closeModal();
+  try {
+    const r = await apiFetch(`/admin/devices/${pendingApproveId}/approve`, 'POST', { testerName: name });
+    const json = await r.json().catch(() => ({}));
+    if (r.ok && json.ok !== false) {
+      toast(`✓ ${name} approved`);
+      addLog('ok', `Approved: ${name} → ${pendingApproveId.slice(0, 12)}`);
+    } else {
+      toast(`✗ ${json.error || 'Approve failed'}`);
+      addLog('err', `Approve failed: ${json.error}`);
+    }
+  } catch (e) {
+    toast(`✗ ${e.message}`);
+  }
+  refresh();
+}
+
+document.getElementById('approve-modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('approve-modal')) closeModal();
+});
+
+// ── Toast ──────────────────────────────────────────────
+let toastTimer;
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2800);
+}
+
+// ── Activity log ───────────────────────────────────────
+function addLog(cls, msg) {
+  const ts = new Date().toLocaleTimeString();
+  logs.unshift({ cls, msg, ts });
+  if (logs.length > 50) logs.pop();
+  renderLogs();
+}
+
+function renderLogs() {
+  const box = document.getElementById('log-box');
+  if (logs.length === 0) { box.innerHTML = '<div>No activity yet</div>'; return; }
+  box.innerHTML = logs.map(l =>
+    `<div class="${l.cls}">[${l.ts}] ${esc(l.msg)}</div>`
+  ).join('');
+}
+
+// ── Helpers ────────────────────────────────────────────
+function fmtDuration(sec) {
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec/60)}m`;
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return `${h}h ${m}m`;
+}
+
+function timeSince(iso) {
+  const diff = Date.now() - new Date(iso).getTime();
+  if (diff < 0) return 'just now';
+  if (diff < 60000) return `${Math.floor(diff/1000)}s ago`;
+  if (diff < 3600000) return `${Math.floor(diff/60000)}m ago`;
+  return `${Math.floor(diff/3600000)}h ago`;
+}
+
+function esc(s) {
+  return String(s || '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+</script>
+</body>
+</html>
